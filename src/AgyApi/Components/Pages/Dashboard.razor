@@ -1,0 +1,1146 @@
+@page "/"
+@inject IModelRegistryService ModelRegistry
+@inject IApiKeyManager ApiKeyManager
+@inject IAgyProcessService AgyProcess
+@inject IAgyWorkerPool WorkerPool
+@inject IDialogService DialogService
+@inject ISnackbar Snackbar
+@inject IJSRuntime JS
+
+<!-- Page Header -->
+<div class="d-flex flex-column flex-sm-row justify-space-between align-start align-sm-center gap-3 mb-6">
+    <div>
+        <div class="d-flex align-center gap-2">
+            <MudText Typo="Typo.h5" Class="font-weight-bold" Style="color: #f8fafc; letter-spacing: -0.02em;">
+                Telemetry & API Gateway
+            </MudText>
+            <span class="token-badge token-badge-success d-none d-sm-inline-flex">
+                <span class="pulse-dot" style="width: 5px; height: 5px;"></span> Healthy
+            </span>
+        </div>
+        <MudText Typo="Typo.body2" Style="color: #64748b; margin-top: 2px;">
+            Local OpenAI-compatible inference proxy powered by <strong>agy</strong>. Monitor cumulative token usage per client key.
+        </MudText>
+    </div>
+
+    <div class="d-flex align-center gap-2">
+        <MudButton Variant="Variant.Filled"
+                   Color="Color.Primary"
+                   StartIcon="@Icons.Material.Filled.Add"
+                   OnClick="OpenCreateKeyDialog"
+                   Style="font-weight: 600; text-transform: none; border-radius: 8px; padding: 6px 16px; box-shadow: 0 0 16px rgba(56, 189, 248, 0.25);">
+            Create API Key
+        </MudButton>
+    </div>
+</div>
+
+<!-- KPI Metrics Grid -->
+<MudGrid Class="mb-6" Spacing="2">
+    <!-- 1. Total Tokens -->
+    <MudItem xs="6" sm="6" lg="3">
+        <div class="metric-tile">
+            <div class="d-flex justify-space-between align-center mb-1 mb-sm-2">
+                <span style="color: #94a3b8; font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em;">
+                    <span class="d-none d-sm-inline">Total Tokens Used</span>
+                    <span class="d-inline d-sm-none">Tokens</span>
+                </span>
+                <div style="background: rgba(56, 189, 248, 0.1); padding: 4px; border-radius: 6px;">
+                    <MudIcon Icon="@Icons.Material.Filled.DataUsage" Size="Size.Small" Style="color: #38bdf8;" />
+                </div>
+            </div>
+            <div class="d-flex align-baseline gap-1 gap-sm-2">
+                <span style="font-size: clamp(1.2rem, 3.5vw, 1.65rem); font-weight: 700; color: #f8fafc; font-family: var(--font-mono); letter-spacing: -0.02em;">
+                    @FormatTokens(TotalTokensAcrossKeys)
+                </span>
+                <span class="d-none d-sm-inline" style="font-size: 0.75rem; color: #64748b;">cumulative</span>
+            </div>
+            <div class="d-flex align-center justify-space-between mt-2 pt-1 pt-sm-2" style="border-top: 1px solid rgba(255, 255, 255, 0.05); font-size: 0.7rem; color: #94a3b8;">
+                <span class="d-none d-sm-inline">Prompt: <strong style="color: #cbd5e1; font-family: var(--font-mono);">@FormatTokens(TotalPromptTokens)</strong></span>
+                <span class="d-none d-sm-inline">Output: <strong style="color: #cbd5e1; font-family: var(--font-mono);">@FormatTokens(TotalCompletionTokens)</strong></span>
+                <span class="d-inline d-sm-none" style="font-family: var(--font-mono); font-size: 0.65rem;">In @FormatTokens(TotalPromptTokens) · Out @FormatTokens(TotalCompletionTokens)</span>
+            </div>
+        </div>
+    </MudItem>
+
+    <!-- 2. Total Requests -->
+    <MudItem xs="6" sm="6" lg="3">
+        <div class="metric-tile">
+            <div class="d-flex justify-space-between align-center mb-1 mb-sm-2">
+                <span style="color: #94a3b8; font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em;">
+                    <span class="d-none d-sm-inline">API Requests</span>
+                    <span class="d-inline d-sm-none">Requests</span>
+                </span>
+                <div style="background: rgba(168, 85, 247, 0.1); padding: 4px; border-radius: 6px;">
+                    <MudIcon Icon="@Icons.Material.Filled.SyncAlt" Size="Size.Small" Style="color: #c084fc;" />
+                </div>
+            </div>
+            <div class="d-flex align-baseline gap-1 gap-sm-2">
+                <span style="font-size: clamp(1.2rem, 3.5vw, 1.65rem); font-weight: 700; color: #f8fafc; font-family: var(--font-mono); letter-spacing: -0.02em;">
+                    @TotalRequestsAcrossKeys.ToString("N0")
+                </span>
+                <span class="d-none d-sm-inline" style="font-size: 0.75rem; color: #64748b;">requests</span>
+            </div>
+            <div class="d-flex align-center justify-space-between mt-2 pt-1 pt-sm-2" style="border-top: 1px solid rgba(255, 255, 255, 0.05); font-size: 0.7rem; color: #94a3b8;">
+                <span class="d-none d-sm-inline">Throughput:</span>
+                <span style="color: #cbd5e1; font-family: var(--font-mono); font-size: 0.68rem;">
+                    @(TotalRequestsAcrossKeys > 0 ? (TotalTokensAcrossKeys / TotalRequestsAcrossKeys).ToString("N0") : "0") tok/req
+                </span>
+            </div>
+        </div>
+    </MudItem>
+
+    <!-- 3. Active Keys -->
+    <MudItem xs="6" sm="6" lg="3">
+        <div class="metric-tile">
+            <div class="d-flex justify-space-between align-center mb-1 mb-sm-2">
+                <span style="color: #94a3b8; font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em;">
+                    <span class="d-none d-sm-inline">Active API Keys</span>
+                    <span class="d-inline d-sm-none">Active Keys</span>
+                </span>
+                <div style="background: rgba(52, 211, 153, 0.1); padding: 4px; border-radius: 6px;">
+                    <MudIcon Icon="@Icons.Material.Filled.VpnKey" Size="Size.Small" Style="color: #34d399;" />
+                </div>
+            </div>
+            <div class="d-flex align-baseline gap-1 gap-sm-2">
+                <span style="font-size: clamp(1.2rem, 3.5vw, 1.65rem); font-weight: 700; color: #f8fafc; font-family: var(--font-mono); letter-spacing: -0.02em;">
+                    @_keys.Count
+                </span>
+                <span class="d-none d-sm-inline" style="font-size: 0.75rem; color: #64748b;">registered</span>
+            </div>
+            <div class="d-flex align-center justify-space-between mt-2 pt-1 pt-sm-2" style="border-top: 1px solid rgba(255, 255, 255, 0.05); font-size: 0.7rem; color: #94a3b8;">
+                <span class="d-none d-sm-inline">Enforcement:</span>
+                <span class="@(_keys.Count > 0 ? "token-badge token-badge-purple" : "token-badge token-badge-amber")" style="font-size: 0.65rem; padding: 1px 5px;">
+                    @(_keys.Count > 0 ? "Bearer Auth" : "Open")
+                </span>
+            </div>
+        </div>
+    </MudItem>
+
+    <!-- 4. Models -->
+    <MudItem xs="6" sm="6" lg="3">
+        <div class="metric-tile">
+            <div class="d-flex justify-space-between align-center mb-1 mb-sm-2">
+                <span style="color: #94a3b8; font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em;">
+                    <span class="d-none d-sm-inline">Local Engine</span>
+                    <span class="d-inline d-sm-none">Models</span>
+                </span>
+                <div style="background: rgba(251, 191, 36, 0.1); padding: 4px; border-radius: 6px;">
+                    <MudIcon Icon="@Icons.Material.Filled.Memory" Size="Size.Small" Style="color: #fbbf24;" />
+                </div>
+            </div>
+            <div class="d-flex align-baseline gap-1 gap-sm-2">
+                <span style="font-size: clamp(1.2rem, 3.5vw, 1.65rem); font-weight: 700; color: #f8fafc; font-family: var(--font-mono); letter-spacing: -0.02em;">
+                    @_models.Count
+                </span>
+                <span class="d-none d-sm-inline" style="font-size: 0.75rem; color: #64748b;">models</span>
+            </div>
+            <div class="d-flex align-center justify-space-between mt-2 pt-1 pt-sm-2" style="border-top: 1px solid rgba(255, 255, 255, 0.05); font-size: 0.7rem; color: #94a3b8;">
+                <span class="d-none d-sm-inline">Status:</span>
+                <span style="color: #34d399; font-weight: 600; display: flex; align-items: center; gap: 4px; font-size: 0.68rem;">
+                    <span class="pulse-dot" style="width: 5px; height: 5px;"></span> CLI Active
+                </span>
+            </div>
+        </div>
+    </MudItem>
+</MudGrid>
+
+<!-- Segmented Navigation Bar -->
+<div class="d-flex flex-wrap gap-1 p-1 mb-6" style="background: #0d1017; border: 1px solid rgba(255, 255, 255, 0.06); border-radius: 10px; padding: 4px;">
+    <div class="nav-pill @(_activeTab == "keys" ? "active" : "")" @onclick="@(() => _activeTab = "keys")">
+        <MudIcon Icon="@Icons.Material.Filled.VpnKey" Size="Size.Small" />
+        <span>API Keys & Usage</span>
+        <span class="token-badge" style="font-size: 0.7rem; padding: 1px 6px;">@_keys.Count</span>
+    </div>
+
+    <div class="nav-pill @(_activeTab == "playground" ? "active" : "")" @onclick="@(() => _activeTab = "playground")">
+        <MudIcon Icon="@Icons.Material.Filled.Forum" Size="Size.Small" />
+        <span>Chat Playground</span>
+    </div>
+
+    <div class="nav-pill @(_activeTab == "models" ? "active" : "")" @onclick="@(() => _activeTab = "models")">
+        <MudIcon Icon="@Icons.Material.Filled.ViewModule" Size="Size.Small" />
+        <span>Model Catalog</span>
+        <span class="token-badge" style="font-size: 0.7rem; padding: 1px 6px;">@_models.Count</span>
+    </div>
+
+    <div class="nav-pill @(_activeTab == "docs" ? "active" : "")" @onclick="@(() => _activeTab = "docs")">
+        <MudIcon Icon="@Icons.Material.Filled.Code" Size="Size.Small" />
+        <span>Integration Guide</span>
+    </div>
+
+    <div class="nav-pill @(_activeTab == "workers" ? "active" : "")" @onclick="@(() => _activeTab = "workers")">
+        <MudIcon Icon="@Icons.Material.Filled.Layers" Size="Size.Small" />
+        <span>Worker Pool</span>
+        <span class="token-badge token-badge-purple" style="font-size: 0.7rem; padding: 1px 6px;">@(_poolStats?.TotalWorkers ?? 0)</span>
+    </div>
+</div>
+
+<!-- ==================================================================== -->
+<!-- TAB 1: API KEYS & TOKEN USAGE                                        -->
+<!-- ==================================================================== -->
+@if (_activeTab == "keys")
+{
+    <div class="saas-card pa-4 pa-sm-6 mb-6">
+        <div class="d-flex flex-column flex-sm-row justify-space-between align-start align-sm-center gap-3 mb-6">
+            <div>
+                <MudText Typo="Typo.subtitle1" Class="font-weight-bold" Style="color: #f8fafc;">
+                    API Keys
+                </MudText>
+                <MudText Typo="Typo.body2" Style="color: #64748b;">
+                    Authenticate external developer tooling and track exact token consumption per client.
+                </MudText>
+            </div>
+
+            <div class="d-flex align-center gap-2 w-100 w-sm-auto">
+                <MudTextField @bind-Value="_keySearchText"
+                              Placeholder="Search keys..."
+                              Adornment="Adornment.Start"
+                              AdornmentIcon="@Icons.Material.Filled.Search"
+                              Variant="Variant.Outlined"
+                              Margin="Margin.Dense"
+                              Immediate="true"
+                              Clearable="true"
+                              Style="min-width: 200px; background: #080a0f;" />
+
+                <MudIconButton Icon="@Icons.Material.Filled.Refresh"
+                               Color="Color.Default"
+                               OnClick="LoadDataAsync"
+                               aria-label="Refresh Keys"
+                               Style="border: 1px solid rgba(255, 255, 255, 0.06); border-radius: 8px;" />
+            </div>
+        </div>
+
+        @if (_keys.Count == 0)
+        {
+            <!-- Centered Onboarding Empty State -->
+            <div class="pa-12 text-center" style="background: rgba(8, 10, 15, 0.6); border: 1px dashed rgba(255, 255, 255, 0.08); border-radius: 12px;">
+                <div style="width: 52px; height: 52px; background: rgba(56, 189, 248, 0.08); border: 1px solid rgba(56, 189, 248, 0.2); border-radius: 50%; display: flex; align-items: center; justify-content: center; margin: 0 auto 16px;">
+                    <MudIcon Icon="@Icons.Material.Filled.VpnKey" Size="Size.Medium" Style="color: #38bdf8;" />
+                </div>
+                <MudText Typo="Typo.subtitle1" Class="font-weight-bold" Style="color: #f8fafc;">
+                    No API Keys Created Yet
+                </MudText>
+                <MudText Typo="Typo.body2" Style="color: #94a3b8; max-width: 440px; margin: 8px auto 20px; line-height: 1.5;">
+                    Open local loopback access is currently active. Generate an API key to track tokens and connect Cursor, LibreChat, or custom agents.
+                </MudText>
+                <MudButton Variant="Variant.Filled"
+                           Color="Color.Primary"
+                           StartIcon="@Icons.Material.Filled.Add"
+                           OnClick="OpenCreateKeyDialog"
+                           Style="font-weight: 600; text-transform: none; border-radius: 8px;">
+                    Generate API Key
+                </MudButton>
+            </div>
+        }
+        else
+        {
+            <!-- Token Usage Breakdown Visualization Bar (when tokens > 0) -->
+            @if (TotalTokensAcrossKeys > 0)
+            {
+                <div class="pa-4 mb-6" style="background: rgba(8, 10, 15, 0.6); border: 1px solid rgba(255, 255, 255, 0.05); border-radius: 10px;">
+                    <div class="d-flex justify-space-between align-center mb-2">
+                        <span style="font-size: 0.75rem; font-weight: 600; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.04em;">
+                            Token Consumption Distribution
+                        </span>
+                        <span style="font-size: 0.72rem; font-family: var(--font-mono); color: #38bdf8;">
+                            @FormatTokens(TotalTokensAcrossKeys) total
+                        </span>
+                    </div>
+
+                    <!-- Visual Segmented Bar -->
+                    <div style="display: flex; height: 8px; width: 100%; border-radius: 4px; overflow: hidden; background: rgba(255, 255, 255, 0.04); gap: 2px;">
+                        @foreach (var (key, color) in KeyColorPairs)
+                        {
+                            var pct = TotalTokensAcrossKeys > 0 ? ((double)key.TotalTokens / TotalTokensAcrossKeys) * 100.0 : 0;
+                            if (pct > 0)
+                            {
+                                <div style="width: @pct.ToString("F1", System.Globalization.CultureInfo.InvariantCulture)%; background-color: @color; height: 100%; border-radius: 2px;"
+                                     title="@key.Name: @pct.ToString("F1")% (@FormatTokens(key.TotalTokens) tokens)">
+                                </div>
+                            }
+                        }
+                    </div>
+
+                    <!-- Legend -->
+                    <div class="d-flex flex-wrap gap-3 mt-3">
+                        @foreach (var (key, color) in KeyColorPairs)
+                        {
+                            var pct = TotalTokensAcrossKeys > 0 ? ((double)key.TotalTokens / TotalTokensAcrossKeys) * 100.0 : 0;
+                            <div class="d-flex align-center gap-1" style="font-size: 0.72rem; color: #94a3b8;">
+                                <span style="width: 8px; height: 8px; border-radius: 2px; background-color: @color; display: inline-block;"></span>
+                                <span style="color: #f1f5f9; font-weight: 500;">@key.Name:</span>
+                                <span style="font-family: var(--font-mono);">@FormatTokens(key.TotalTokens) (@pct.ToString("F0")%)</span>
+                            </div>
+                        }
+                    </div>
+                </div>
+            }
+
+            <!-- Desktop & Tablet Table View (Hidden on mobile) -->
+            <div class="d-none d-md-block" style="overflow-x: auto;">
+                <table style="width: 100%; border-collapse: collapse;">
+                    <thead>
+                        <tr style="border-bottom: 1px solid rgba(255, 255, 255, 0.06); text-align: left;">
+                            <th style="padding: 12px 16px; font-size: 0.72rem; font-weight: 700; color: #64748b; text-transform: uppercase; letter-spacing: 0.06em;">Client / Name</th>
+                            <th style="padding: 12px 16px; font-size: 0.72rem; font-weight: 700; color: #64748b; text-transform: uppercase; letter-spacing: 0.06em;">Masked Token</th>
+                            <th style="padding: 12px 16px; font-size: 0.72rem; font-weight: 700; color: #64748b; text-transform: uppercase; letter-spacing: 0.06em;">Token Telemetry</th>
+                            <th style="padding: 12px 16px; font-size: 0.72rem; font-weight: 700; color: #64748b; text-transform: uppercase; letter-spacing: 0.06em;">Requests</th>
+                            <th style="padding: 12px 16px; font-size: 0.72rem; font-weight: 700; color: #64748b; text-transform: uppercase; letter-spacing: 0.06em;">Last Active</th>
+                            <th style="padding: 12px 16px; font-size: 0.72rem; font-weight: 700; color: #64748b; text-transform: uppercase; letter-spacing: 0.06em; text-align: right;">Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        @foreach (var item in FilteredKeys)
+                        {
+                            <tr style="border-bottom: 1px solid rgba(255, 255, 255, 0.04); transition: background 0.15s ease;" class="mud-table-row">
+                                <td style="padding: 14px 16px;">
+                                    <div class="d-flex align-center gap-2">
+                                        <div style="width: 32px; height: 32px; border-radius: 8px; background: rgba(56, 189, 248, 0.08); border: 1px solid rgba(56, 189, 248, 0.15); display: flex; align-items: center; justify-content: center;">
+                                            <MudIcon Icon="@Icons.Material.Filled.Key" Size="Size.Small" Style="color: #38bdf8;" />
+                                        </div>
+                                        <div>
+                                            <div style="font-weight: 600; color: #f8fafc; font-size: 0.88rem;">@item.Name</div>
+                                            <div style="font-size: 0.7rem; color: #64748b; font-family: var(--font-mono);">
+                                                ID: @item.Id[..Math.Min(8, item.Id.Length)]...
+                                            </div>
+                                        </div>
+                                    </div>
+                                </td>
+
+                                <td style="padding: 14px 16px;">
+                                    <div class="d-flex align-center gap-1">
+                                        <span class="token-badge">@item.MaskedKey</span>
+                                        <MudIconButton Icon="@Icons.Material.Filled.ContentCopy"
+                                                       Size="Size.Small"
+                                                       Style="color: #64748b;"
+                                                       OnClick="@(() => CopyText(item.MaskedKey, "Masked key copied"))"
+                                                       aria-label="Copy Masked Key" />
+                                    </div>
+                                </td>
+
+                                <td style="padding: 14px 16px;">
+                                    <div>
+                                        <span class="token-badge token-badge-purple">
+                                            <MudIcon Icon="@Icons.Material.Filled.Bolt" Size="Size.Small" />
+                                            @FormatTokens(item.TotalTokens)
+                                        </span>
+                                        <div style="font-size: 0.72rem; color: #64748b; margin-top: 3px;">
+                                            In: <span style="color: #cbd5e1; font-family: var(--font-mono);">@FormatTokens(item.PromptTokens)</span> · Out: <span style="color: #cbd5e1; font-family: var(--font-mono);">@FormatTokens(item.CompletionTokens)</span>
+                                        </div>
+                                    </div>
+                                </td>
+
+                                <td style="padding: 14px 16px;">
+                                    <span class="token-badge token-badge-success">
+                                        @item.RequestCount.ToString("N0") reqs
+                                    </span>
+                                </td>
+
+                                <td style="padding: 14px 16px;">
+                                    <div class="d-flex align-center gap-1">
+                                        <span class="pulse-dot" style="width: 5px; height: 5px; background-color: @(item.LastUsedAtUtc.HasValue ? "#10b981" : "#64748b");"></span>
+                                        <span style="font-size: 0.78rem; color: #94a3b8;">
+                                            @GetRelativeTime(item.LastUsedAtUtc)
+                                        </span>
+                                    </div>
+                                </td>
+
+                                <td style="padding: 14px 16px; text-align: right;">
+                                    <div class="d-flex align-center justify-end gap-1">
+                                        <MudTooltip Text="Reset token usage statistics">
+                                            <MudIconButton Icon="@Icons.Material.Filled.RestartAlt"
+                                                           Size="Size.Small"
+                                                           Color="Color.Warning"
+                                                           OnClick="@(() => ResetKeyUsage(item.Id, item.Name))"
+                                                           aria-label="Reset Usage" />
+                                        </MudTooltip>
+
+                                        <MudTooltip Text="Revoke key permanently">
+                                            <MudIconButton Icon="@Icons.Material.Filled.DeleteOutline"
+                                                           Size="Size.Small"
+                                                           Color="Color.Error"
+                                                           OnClick="@(() => RevokeKey(item.Id, item.Name))"
+                                                           aria-label="Revoke Key" />
+                                        </MudTooltip>
+                                    </div>
+                                </td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+            </div>
+
+            <!-- Mobile Card View (Only shown on mobile <= 768px, eliminates horizontal scrolling) -->
+            <div class="d-block d-md-none d-flex flex-column gap-3">
+                @foreach (var item in FilteredKeys)
+                {
+                    <div class="pa-4" style="background: #080a0f; border: 1px solid rgba(255, 255, 255, 0.06); border-radius: 10px;">
+                        <div class="d-flex justify-space-between align-center mb-2">
+                            <div class="d-flex align-center gap-2">
+                                <div style="width: 28px; height: 28px; border-radius: 6px; background: rgba(56, 189, 248, 0.1); display: flex; align-items: center; justify-content: center;">
+                                    <MudIcon Icon="@Icons.Material.Filled.Key" Size="Size.Small" Style="color: #38bdf8;" />
+                                </div>
+                                <span style="font-weight: 600; color: #f8fafc; font-size: 0.9rem;">@item.Name</span>
+                            </div>
+                            <span class="token-badge token-badge-success" style="font-size: 0.7rem;">@item.RequestCount reqs</span>
+                        </div>
+
+                        <div class="d-flex align-center justify-space-between my-2 pa-2" style="background: rgba(255, 255, 255, 0.02); border-radius: 6px;">
+                            <span class="token-badge" style="font-size: 0.72rem;">@item.MaskedKey</span>
+                            <MudIconButton Icon="@Icons.Material.Filled.ContentCopy" Size="Size.Small" Style="color: #64748b;" OnClick="@(() => CopyText(item.MaskedKey, "Copied"))" aria-label="Copy Key" />
+                        </div>
+
+                        <div class="d-flex justify-space-between align-center my-2" style="font-size: 0.78rem;">
+                            <span style="color: #94a3b8;">Tokens Used:</span>
+                            <span class="token-badge token-badge-purple">@FormatTokens(item.TotalTokens)</span>
+                        </div>
+
+                        <div class="d-flex justify-space-between align-center my-2" style="font-size: 0.72rem; color: #64748b;">
+                            <span>In: @FormatTokens(item.PromptTokens) · Out: @FormatTokens(item.CompletionTokens)</span>
+                            <span>Active: @GetRelativeTime(item.LastUsedAtUtc)</span>
+                        </div>
+
+                        <div class="d-flex justify-end gap-2 pt-2 mt-2" style="border-top: 1px solid rgba(255, 255, 255, 0.04);">
+                            <MudButton Size="Size.Small" Variant="Variant.Outlined" Color="Color.Warning" StartIcon="@Icons.Material.Filled.RestartAlt" OnClick="@(() => ResetKeyUsage(item.Id, item.Name))">
+                                Reset
+                            </MudButton>
+                            <MudButton Size="Size.Small" Variant="Variant.Outlined" Color="Color.Error" StartIcon="@Icons.Material.Filled.DeleteOutline" OnClick="@(() => RevokeKey(item.Id, item.Name))">
+                                Revoke
+                            </MudButton>
+                        </div>
+                    </div>
+                }
+            </div>
+        }
+    </div>
+}
+
+<!-- ==================================================================== -->
+<!-- TAB 2: CHAT PLAYGROUND                                               -->
+<!-- ==================================================================== -->
+@if (_activeTab == "playground")
+{
+    <div class="saas-card pa-4 pa-sm-6 mb-6">
+        <MudGrid>
+            <!-- Chat Window -->
+            <MudItem xs="12" md="8">
+                <div class="d-flex flex-column" style="background: #080a0f; border: 1px solid rgba(255, 255, 255, 0.06); border-radius: 12px; height: 560px; padding: 16px;">
+                    
+                    <!-- Header -->
+                    <div class="d-flex justify-space-between align-center pb-3 mb-3" style="border-bottom: 1px solid rgba(255, 255, 255, 0.06);">
+                        <div class="d-flex align-center gap-2">
+                            <span class="token-badge">@_selectedModel</span>
+                            @if (_enableAgentic)
+                            {
+                                <span class="token-badge token-badge-amber">Agentic Mode</span>
+                            }
+                        </div>
+
+                        <MudButton Size="Size.Small" Variant="Variant.Text" Color="Color.Default" StartIcon="@Icons.Material.Filled.DeleteSweep" OnClick="ClearChat" Disabled="_isStreaming" Style="color: #64748b; font-size: 0.75rem;">
+                            Clear History
+                        </MudButton>
+                    </div>
+
+                    <!-- Messages -->
+                    <div style="flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; padding-right: 4px;" id="chat-stream-container">
+                        @if (_chatMessages.Count == 0)
+                        {
+                            <div class="pa-8 text-center" style="color: #64748b; margin: auto;">
+                                <div style="width: 44px; height: 44px; background: rgba(56, 189, 248, 0.08); border-radius: 50%; display: flex; align-items: center; justify-content: center; margin: 0 auto 12px;">
+                                    <MudIcon Icon="@Icons.Material.Filled.Forum" Size="Size.Small" Style="color: #38bdf8;" />
+                                </div>
+                                <MudText Typo="Typo.subtitle2" Class="font-weight-bold" Style="color: #f1f5f9;">Test Inference Locally</MudText>
+                                <MudText Typo="Typo.caption" Style="color: #64748b; max-width: 360px; margin: 4px auto 0; display: block;">
+                                    Type a prompt below to stream responses directly from your native AGY process.
+                                </MudText>
+                            </div>
+                        }
+
+                        @foreach (var msg in _chatMessages)
+                        {
+                            var isUser = msg.Role == "user";
+                            <div style="align-self: @(isUser ? "flex-end" : "flex-start"); max-width: 85%;">
+                                <div class="pa-3" style="@(isUser 
+                                    ? "background: #0284c7; color: white; border-radius: 12px 12px 2px 12px; box-shadow: 0 4px 12px rgba(2, 132, 199, 0.2);" 
+                                    : "background: #121620; color: #f8fafc; border: 1px solid rgba(255, 255, 255, 0.07); border-radius: 12px 12px 12px 2px;")">
+                                    <div class="d-flex align-center justify-space-between mb-1" style="font-size: 0.68rem; text-transform: uppercase; font-weight: 700; color: @(isUser ? "#bae6fd" : "#38bdf8");">
+                                        <span>@(isUser ? "You" : "Assistant")</span>
+                                    </div>
+                                    <div style="font-size: 0.85rem; line-height: 1.5; white-space: pre-wrap; word-break: break-word;">@msg.Content</div>
+                                </div>
+                            </div>
+                        }
+
+                        @if (_isStreaming && !string.IsNullOrEmpty(_streamingDelta))
+                        {
+                            <div style="align-self: flex-start; max-width: 85%;">
+                                <div class="pa-3" style="background: #121620; color: #f8fafc; border: 1px solid rgba(56, 189, 248, 0.35); border-radius: 12px 12px 12px 2px; box-shadow: 0 0 15px rgba(56, 189, 248, 0.08);">
+                                    <div class="d-flex align-center gap-1 mb-1" style="font-size: 0.68rem; font-weight: 700; color: #38bdf8;">
+                                        <span class="pulse-dot" style="width: 5px; height: 5px; background-color: #38bdf8;"></span>
+                                        <span>Streaming...</span>
+                                    </div>
+                                    <div style="font-size: 0.85rem; line-height: 1.5; white-space: pre-wrap; word-break: break-word;">@_streamingDelta</div>
+                                </div>
+                            </div>
+                        }
+                    </div>
+
+                    <!-- Input -->
+                    <div class="pt-3 mt-3" style="border-top: 1px solid rgba(255, 255, 255, 0.06);">
+                        <div class="d-flex gap-2">
+                            <MudTextField @bind-Value="_promptText"
+                                          Placeholder="Send a message... (Enter to send)"
+                                          Variant="Variant.Outlined"
+                                          Margin="Margin.Dense"
+                                          FullWidth="true"
+                                          Immediate="true"
+                                          OnKeyDown="HandleKeyDown"
+                                          Disabled="_isStreaming"
+                                          Style="background: #0d1017;" />
+                            <MudButton Variant="Variant.Filled"
+                                       Color="Color.Primary"
+                                       OnClick="SendChatPrompt"
+                                       Disabled="@(_isStreaming || string.IsNullOrWhiteSpace(_promptText))"
+                                       Style="font-weight: 600; text-transform: none; border-radius: 8px;">
+                                @if (_isStreaming)
+                                {
+                                    <MudProgressCircular Size="Size.Small" Indeterminate="true" Class="mr-1" />
+                                }
+                                else
+                                {
+                                    <MudIcon Icon="@Icons.Material.Filled.Send" Size="Size.Small" Class="mr-1" />
+                                    <span>Send</span>
+                                }
+                            </MudButton>
+                        </div>
+                    </div>
+                </div>
+            </MudItem>
+
+            <!-- Settings Sidebar -->
+            <MudItem xs="12" md="4">
+                <div class="pa-4 d-flex flex-column gap-4" style="background: #080a0f; border: 1px solid rgba(255, 255, 255, 0.06); border-radius: 12px; height: 100%;">
+                    <div>
+                        <MudText Typo="Typo.subtitle2" Class="font-weight-bold" Style="color: #f8fafc;">Runtime Options</MudText>
+                        <MudText Typo="Typo.caption" Style="color: #64748b;">Configure inference target and tool access.</MudText>
+                    </div>
+
+                    <div>
+                        <MudText Typo="Typo.caption" Style="color: #94a3b8; font-weight: 600; text-transform: uppercase;" Class="mb-1 d-block">
+                            Select AGY Model
+                        </MudText>
+                        <MudSelect T="string" @bind-Value="_selectedModel" Variant="Variant.Outlined" Margin="Margin.Dense" FullWidth="true">
+                            @foreach (var m in _models)
+                            {
+                                <MudSelectItem Value="@m">@m</MudSelectItem>
+                            }
+                        </MudSelect>
+                    </div>
+
+                    <div class="pa-3" style="background: rgba(255, 255, 255, 0.02); border: 1px solid rgba(255, 255, 255, 0.05); border-radius: 8px;">
+                        <div class="d-flex align-center justify-space-between mb-1">
+                            <span style="font-weight: 600; font-size: 0.82rem; color: #f8fafc;">Agentic Tool Execution</span>
+                            <MudSwitch T="bool" @bind-Value="_enableAgentic" Color="Color.Warning" />
+                        </div>
+                        <MudText Typo="Typo.caption" Style="color: #64748b; line-height: 1.4;" Class="d-block">
+                            Permits AGY to run workspace shell commands and edit local files (<code>--dangerously-skip-permissions</code>).
+                        </MudText>
+                    </div>
+
+                    @if (_lastUsage != null)
+                    {
+                        <div class="pa-3" style="background: rgba(56, 189, 248, 0.04); border: 1px solid rgba(56, 189, 248, 0.15); border-radius: 8px;">
+                            <span style="font-size: 0.72rem; font-weight: 700; color: #38bdf8; text-transform: uppercase; letter-spacing: 0.04em; display: block; margin-bottom: 8px;">
+                                Turn Telemetry
+                            </span>
+                            <div class="d-flex justify-space-between mb-1" style="font-size: 0.75rem;">
+                                <span style="color: #94a3b8;">Input Tokens:</span>
+                                <span style="font-family: var(--font-mono); color: #f8fafc; font-weight: 600;">@_lastUsage.InputTokens.ToString("N0")</span>
+                            </div>
+                            <div class="d-flex justify-space-between mb-1" style="font-size: 0.75rem;">
+                                <span style="color: #94a3b8;">Output Tokens:</span>
+                                <span style="font-family: var(--font-mono); color: #f8fafc; font-weight: 600;">@_lastUsage.OutputTokens.ToString("N0")</span>
+                            </div>
+                            <div class="d-flex justify-space-between pt-1" style="font-size: 0.8rem; border-top: 1px solid rgba(255, 255, 255, 0.06);">
+                                <span style="color: #cbd5e1; font-weight: 600;">Total:</span>
+                                <span style="font-family: var(--font-mono); color: #38bdf8; font-weight: 700;">@_lastUsage.TotalTokens.ToString("N0")</span>
+                            </div>
+                        </div>
+                    }
+
+                    <MudSpacer />
+
+                    <div style="font-size: 0.7rem; color: #64748b; font-family: var(--font-mono); text-align: center;">
+                        Local CLI: ./workspace
+                    </div>
+                </div>
+            </MudItem>
+        </MudGrid>
+    </div>
+}
+
+<!-- ==================================================================== -->
+<!-- TAB 3: NATIVE MODELS CATALOG                                         -->
+<!-- ==================================================================== -->
+@if (_activeTab == "models")
+{
+    <div class="saas-card pa-4 pa-sm-6 mb-6">
+        <div class="d-flex flex-column flex-sm-row justify-space-between align-start align-sm-center gap-3 mb-6">
+            <div>
+                <MudText Typo="Typo.subtitle1" Class="font-weight-bold" Style="color: #f8fafc;">
+                    Discovered Local Models (@_models.Count)
+                </MudText>
+                <MudText Typo="Typo.body2" Style="color: #64748b;">
+                    Discovered dynamically via <code>agy models</code>. Requestable under standard <code>/v1/models</code>.
+                </MudText>
+            </div>
+
+            <MudTextField @bind-Value="_modelSearchText"
+                          Placeholder="Filter models..."
+                          Adornment="Adornment.Start"
+                          AdornmentIcon="@Icons.Material.Filled.Search"
+                          Variant="Variant.Outlined"
+                          Margin="Margin.Dense"
+                          Immediate="true"
+                          Clearable="true"
+                          Style="min-width: 220px; background: #080a0f;" />
+        </div>
+
+        <MudGrid Spacing="3">
+            @foreach (var m in FilteredModels)
+            {
+                <MudItem xs="12" sm="6" lg="4">
+                    <div class="pa-4" style="background: #080a0f; border: 1px solid rgba(255, 255, 255, 0.06); border-radius: 10px; transition: border-color 0.15s ease;">
+                        <div class="d-flex align-center justify-space-between mb-3">
+                            <div class="d-flex align-center gap-2">
+                                <div style="background: rgba(56, 189, 248, 0.08); padding: 6px; border-radius: 6px;">
+                                    <MudIcon Icon="@Icons.Material.Filled.SmartToy" Size="Size.Small" Style="color: #38bdf8;" />
+                                </div>
+                                <div style="min-width: 0;">
+                                    <div style="font-weight: 600; color: #f8fafc; font-family: var(--font-mono); font-size: 0.85rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
+                                        @m
+                                    </div>
+                                    <span style="font-size: 0.7rem; color: #64748b;">Native AGY Model</span>
+                                </div>
+                            </div>
+                            <MudIconButton Icon="@Icons.Material.Filled.ContentCopy"
+                                           Size="Size.Small"
+                                           Style="color: #64748b;"
+                                           OnClick="@(() => CopyText(m, $"Copied '{m}'"))"
+                                           aria-label="Copy Model Name" />
+                        </div>
+
+                        <div class="d-flex align-center justify-space-between pt-3" style="border-top: 1px solid rgba(255, 255, 255, 0.04);">
+                            <span class="token-badge" style="font-size: 0.68rem; padding: 1px 6px;">OpenAI Ready</span>
+                            <MudButton Size="Size.Small"
+                                       Color="Color.Primary"
+                                       Variant="Variant.Text"
+                                       EndIcon="@Icons.Material.Filled.ArrowForward"
+                                       OnClick="@(() => SwitchToPlaygroundWithModel(m))"
+                                       Style="text-transform: none; font-size: 0.78rem;">
+                                Test
+                            </MudButton>
+                        </div>
+                    </div>
+                </MudItem>
+            }
+        </MudGrid>
+    </div>
+}
+
+<!-- ==================================================================== -->
+<!-- TAB 4: INTEGRATION GUIDE                                             -->
+<!-- ==================================================================== -->
+@if (_activeTab == "docs")
+{
+    <div class="saas-card pa-4 pa-sm-6 mb-6">
+        <div class="d-flex flex-column flex-sm-row justify-space-between align-start align-sm-center gap-3 mb-6">
+            <div>
+                <MudText Typo="Typo.subtitle1" Class="font-weight-bold" Style="color: #f8fafc;">
+                    Client Connection Guide
+                </MudText>
+                <MudText Typo="Typo.body2" Style="color: #64748b;">
+                    Point any OpenAI client to <code>http://127.0.0.1:5200/v1</code>. Select an active key to update code samples dynamically.
+                </MudText>
+            </div>
+
+            <div style="min-width: 220px;">
+                <MudSelect T="string" Label="Select Key for Snippets" @bind-Value="_selectedKeyForSnippet" Variant="Variant.Outlined" Margin="Margin.Dense">
+                    <MudSelectItem Value="@("YOUR_API_KEY")">YOUR_API_KEY (Placeholder)</MudSelectItem>
+                    @foreach (var k in _keys)
+                    {
+                        <MudSelectItem Value="@k.MaskedKey">@k.Name (@k.MaskedKey)</MudSelectItem>
+                    }
+                </MudSelect>
+            </div>
+        </div>
+
+        <MudTabs Elevation="0" Rounded="true" Color="Color.Dark" Class="mb-4">
+            <MudTabPanel Text="Python (OpenAI SDK)">
+                <div class="code-container mt-3">
+                    <MudIconButton Icon="@Icons.Material.Filled.ContentCopy"
+                                   Color="Color.Primary"
+                                   Size="Size.Small"
+                                   Style="position: absolute; top: 10px; right: 10px;"
+                                   OnClick="@(() => CopyText(GetPythonSnippet(), "Python snippet copied"))"
+                                   aria-label="Copy Snippet" />
+                    <pre style="color: #38bdf8; font-size: 0.82rem; margin: 0; white-space: pre-wrap;">@GetPythonSnippet()</pre>
+                </div>
+            </MudTabPanel>
+
+            <MudTabPanel Text="TypeScript / Node.js">
+                <div class="code-container mt-3">
+                    <MudIconButton Icon="@Icons.Material.Filled.ContentCopy"
+                                   Color="Color.Primary"
+                                   Size="Size.Small"
+                                   Style="position: absolute; top: 10px; right: 10px;"
+                                   OnClick="@(() => CopyText(GetTsSnippet(), "TypeScript snippet copied"))"
+                                   aria-label="Copy Snippet" />
+                    <pre style="color: #38bdf8; font-size: 0.82rem; margin: 0; white-space: pre-wrap;">@GetTsSnippet()</pre>
+                </div>
+            </MudTabPanel>
+
+            <MudTabPanel Text="cURL">
+                <div class="code-container mt-3">
+                    <MudIconButton Icon="@Icons.Material.Filled.ContentCopy"
+                                   Color="Color.Primary"
+                                   Size="Size.Small"
+                                   Style="position: absolute; top: 10px; right: 10px;"
+                                   OnClick="@(() => CopyText(GetCurlSnippet(), "cURL snippet copied"))"
+                                   aria-label="Copy Snippet" />
+                    <pre style="color: #38bdf8; font-size: 0.82rem; margin: 0; white-space: pre-wrap;">@GetCurlSnippet()</pre>
+                </div>
+            </MudTabPanel>
+
+            <MudTabPanel Text="C# (.NET)">
+                <div class="code-container mt-3">
+                    <MudIconButton Icon="@Icons.Material.Filled.ContentCopy"
+                                   Color="Color.Primary"
+                                   Size="Size.Small"
+                                   Style="position: absolute; top: 10px; right: 10px;"
+                                   OnClick="@(() => CopyText(GetCSharpSnippet(), "C# snippet copied"))"
+                                   aria-label="Copy Snippet" />
+                    <pre style="color: #38bdf8; font-size: 0.82rem; margin: 0; white-space: pre-wrap;">@GetCSharpSnippet()</pre>
+                </div>
+            </MudTabPanel>
+        </MudTabs>
+    </div>
+}
+
+<!-- ==================================================================== -->
+<!-- TAB 5: PERSISTENT WORKER POOL & DAEMON                               -->
+<!-- ==================================================================== -->
+@if (_activeTab == "workers")
+{
+    <div class="d-flex flex-column gap-6">
+        <div class="d-flex flex-column flex-sm-row justify-space-between align-start align-sm-center gap-3">
+            <div>
+                <MudText Typo="Typo.subtitle1" Class="font-weight-bold" Style="color: #f8fafc;">
+                    Persistent Worker Pool Management
+                </MudText>
+                <MudText Typo="Typo.body2" Style="color: #64748b;">
+                    Warm background CLI processes maintaining open streaming channels. Eliminates terminal flashing and cuts turn latency down to ~3s.
+                </MudText>
+            </div>
+
+            <div class="d-flex align-center gap-2">
+                <MudButton Variant="Variant.Outlined"
+                           Color="Color.Warning"
+                           StartIcon="@Icons.Material.Filled.RestartAlt"
+                           OnClick="RecyclePoolAsync"
+                           Style="font-weight: 600; text-transform: none; border-radius: 8px;">
+                    Recycle Worker Pool
+                </MudButton>
+            </div>
+        </div>
+
+        <!-- Worker Pool Metrics -->
+        <MudGrid Spacing="2">
+            <MudItem xs="6" sm="3">
+                <div class="metric-tile">
+                    <span style="color: #94a3b8; font-size: 0.72rem; font-weight: 600; text-transform: uppercase;">Total Workers</span>
+                    <div style="font-size: 1.5rem; font-weight: 700; color: #f8fafc; font-family: var(--font-mono);">
+                        @(_poolStats?.TotalWorkers ?? 0)
+                    </div>
+                    <div style="font-size: 0.7rem; color: #94a3b8; margin-top: 4px;">
+                        Active: <strong style="color: #38bdf8;">@(_poolStats?.ActiveWorkers ?? 0)</strong> · Idle: <strong style="color: #34d399;">@(_poolStats?.IdleWorkers ?? 0)</strong>
+                    </div>
+                </div>
+            </MudItem>
+
+            <MudItem xs="6" sm="3">
+                <div class="metric-tile">
+                    <span style="color: #94a3b8; font-size: 0.72rem; font-weight: 600; text-transform: uppercase;">Pool Memory (RAM)</span>
+                    <div style="font-size: 1.5rem; font-weight: 700; color: #f8fafc; font-family: var(--font-mono);">
+                        @(((_poolStats?.TotalWorkingSetBytes ?? 0) / (1024.0 * 1024.0)).ToString("F1")) MB
+                    </div>
+                    <div style="font-size: 0.7rem; color: #94a3b8; margin-top: 4px;">
+                        Total Working Set
+                    </div>
+                </div>
+            </MudItem>
+
+            <MudItem xs="6" sm="3">
+                <div class="metric-tile">
+                    <span style="color: #94a3b8; font-size: 0.72rem; font-weight: 600; text-transform: uppercase;">Turns Served</span>
+                    <div style="font-size: 1.5rem; font-weight: 700; color: #f8fafc; font-family: var(--font-mono);">
+                        @(_poolStats?.TotalTurnsCompleted ?? 0)
+                    </div>
+                    <div style="font-size: 0.7rem; color: #94a3b8; margin-top: 4px;">
+                        Zero Process Restarts
+                    </div>
+                </div>
+            </MudItem>
+
+            <MudItem xs="6" sm="3">
+                <div class="metric-tile">
+                    <span style="color: #94a3b8; font-size: 0.72rem; font-weight: 600; text-transform: uppercase;">Protocol</span>
+                    <div style="font-size: 1.5rem; font-weight: 700; color: #34d399; font-family: var(--font-mono);">
+                        NDJSON
+                    </div>
+                    <div style="font-size: 0.7rem; color: #94a3b8; margin-top: 4px;">
+                        Hidden Process Subsystem
+                    </div>
+                </div>
+            </MudItem>
+        </MudGrid>
+
+        <!-- Active Workers Table -->
+        <MudTable Items="@(_poolStats?.Workers ?? Array.Empty<AgyWorkerInfo>())" Elevation="0" Class="dashboard-table" Hover="true">
+            <HeaderContent>
+                <MudTh>Worker ID</MudTh>
+                <MudTh>PID</MudTh>
+                <MudTh>Model</MudTh>
+                <MudTh>Status</MudTh>
+                <MudTh>Turns</MudTh>
+                <MudTh>Memory (RAM)</MudTh>
+                <MudTh>Last Active</MudTh>
+            </HeaderContent>
+            <RowTemplate>
+                <MudTd DataLabel="Worker ID">
+                    <strong style="color: #f8fafc; font-family: var(--font-mono);">@context.Id</strong>
+                </MudTd>
+                <MudTd DataLabel="PID">
+                    <span class="token-badge" style="font-family: var(--font-mono);">@context.ProcessId</span>
+                </MudTd>
+                <MudTd DataLabel="Model">
+                    <span style="color: #94a3b8; font-size: 0.8rem;">@context.Model (@context.Effort)</span>
+                </MudTd>
+                <MudTd DataLabel="Status">
+                    @if (context.IsBusy)
+                    {
+                        <span class="token-badge token-badge-purple">
+                            <span class="pulse-dot" style="width: 5px; height: 5px;"></span> Streaming
+                        </span>
+                    }
+                    else if (context.IsHealthy)
+                    {
+                        <span class="token-badge token-badge-success">
+                            <span class="pulse-dot" style="width: 5px; height: 5px;"></span> Warm Idle
+                        </span>
+                    }
+                    else
+                    {
+                        <span class="token-badge token-badge-amber">Dead</span>
+                    }
+                </MudTd>
+                <MudTd DataLabel="Turns">
+                    <span style="font-family: var(--font-mono); color: #cbd5e1;">@context.TurnCount</span>
+                </MudTd>
+                <MudTd DataLabel="Memory">
+                    <span style="font-family: var(--font-mono); color: #cbd5e1;">@((context.WorkingSetBytes / (1024.0 * 1024.0)).ToString("F1")) MB</span>
+                </MudTd>
+                <MudTd DataLabel="Last Active">
+                    <span style="font-size: 0.75rem; color: #64748b;">@context.LastActiveUtc.ToLocalTime().ToString("HH:mm:ss")</span>
+                </MudTd>
+            </RowTemplate>
+            <NoRecordsContent>
+                <MudText Typo="Typo.body2" Class="pa-4 text-center" Style="color: #64748b;">
+                    No workers currently active in pool.
+                </MudText>
+            </NoRecordsContent>
+        </MudTable>
+    </div>
+}
+
+@code {
+    private List<string> _models = [];
+    private List<ApiKeyItem> _keys = [];
+    private AgyPoolStats? _poolStats;
+    private string _selectedModel = "gemini-3.8-flash-high";
+    private bool _enableAgentic = false;
+
+    // Navigation and filters
+    private string _activeTab = "keys";
+    private string _keySearchText = "";
+    private string _modelSearchText = "";
+    private string _selectedKeyForSnippet = "YOUR_API_KEY";
+
+    // Playground state
+    private string _promptText = "";
+    private bool _isStreaming = false;
+    private string _streamingDelta = "";
+    private List<ChatMessage> _chatMessages = [];
+    private AgyUsage? _lastUsage;
+
+    // KPI sums
+    private long TotalTokensAcrossKeys => _keys.Sum(k => k.TotalTokens);
+    private long TotalPromptTokens => _keys.Sum(k => k.PromptTokens);
+    private long TotalCompletionTokens => _keys.Sum(k => k.CompletionTokens);
+    private long TotalRequestsAcrossKeys => _keys.Sum(k => k.RequestCount);
+
+    private readonly string[] _paletteColors = ["#38bdf8", "#818cf8", "#34d399", "#fbbf24", "#f43f5e", "#a78bfa"];
+
+    private IEnumerable<(ApiKeyItem Key, string Color)> KeyColorPairs =>
+        _keys.Select((k, idx) => (k, _paletteColors[idx % _paletteColors.Length]));
+
+    private IEnumerable<ApiKeyItem> FilteredKeys =>
+        string.IsNullOrWhiteSpace(_keySearchText)
+            ? _keys
+            : _keys.Where(k => k.Name.Contains(_keySearchText, StringComparison.OrdinalIgnoreCase) ||
+                               k.MaskedKey.Contains(_keySearchText, StringComparison.OrdinalIgnoreCase) ||
+                               k.Id.Contains(_keySearchText, StringComparison.OrdinalIgnoreCase));
+
+    private IEnumerable<string> FilteredModels =>
+        string.IsNullOrWhiteSpace(_modelSearchText)
+            ? _models
+            : _models.Where(m => m.Contains(_modelSearchText, StringComparison.OrdinalIgnoreCase));
+
+    protected override async Task OnInitializedAsync()
+    {
+        await LoadDataAsync();
+    }
+
+    private async Task LoadDataAsync()
+    {
+        await ModelRegistry.InitializeAsync();
+        _models = ModelRegistry.GetDiscoveredModels().ToList();
+        if (_models.Count > 0 && !_models.Contains(_selectedModel))
+        {
+            _selectedModel = _models[0];
+        }
+
+        await ApiKeyManager.InitializeAsync();
+        _keys = (await ApiKeyManager.GetKeysAsync()).ToList();
+        _poolStats = WorkerPool.GetStats();
+    }
+
+    private async Task RecyclePoolAsync()
+    {
+        try
+        {
+            await WorkerPool.RecycleAllAsync();
+            _poolStats = WorkerPool.GetStats();
+            Snackbar.Add("Worker pool successfully recycled! Standby workers ready.", Severity.Success);
+        }
+        catch (Exception ex)
+        {
+            Snackbar.Add($"Recycle failed: {ex.Message}", Severity.Error);
+        }
+    }
+
+    private async Task OpenCreateKeyDialog()
+    {
+        var dialog = await DialogService.ShowAsync<Components.Dialogs.CreateKeyDialog>("Create New API Key");
+        var result = await dialog.Result;
+        if (result != null && !result.Canceled)
+        {
+            await LoadDataAsync();
+        }
+    }
+
+    private async Task ResetKeyUsage(string id, string name)
+    {
+        bool? confirmed = await DialogService.ShowMessageBoxAsync(
+            "Reset Token Telemetry",
+            $"Are you sure you want to reset all token counters and request count for '{name}' to 0?",
+            yesText: "Reset Usage", cancelText: "Cancel");
+
+        if (confirmed == true)
+        {
+            await ApiKeyManager.ResetUsageAsync(id);
+            Snackbar.Add($"Token usage reset for '{name}'.", Severity.Info);
+            await LoadDataAsync();
+        }
+    }
+
+    private async Task RevokeKey(string id, string name)
+    {
+        bool? confirmed = await DialogService.ShowMessageBoxAsync(
+            "Revoke Key",
+            $"Are you sure you want to revoke '{name}'? Any connected applications will immediately be denied access.",
+            yesText: "Revoke Key", cancelText: "Cancel");
+
+        if (confirmed == true)
+        {
+            await ApiKeyManager.RevokeKeyAsync(id);
+            Snackbar.Add($"Key '{name}' revoked.", Severity.Warning);
+            await LoadDataAsync();
+        }
+    }
+
+    private void SwitchToPlaygroundWithModel(string model)
+    {
+        _selectedModel = model;
+        _activeTab = "playground";
+        Snackbar.Add($"Switched to Playground with '{model}'", Severity.Info);
+    }
+
+    private async Task HandleKeyDown(KeyboardEventArgs e)
+    {
+        if (e.Key == "Enter" && !e.ShiftKey && !_isStreaming && !string.IsNullOrWhiteSpace(_promptText))
+        {
+            await SendChatPrompt();
+        }
+    }
+
+    private async Task SendChatPrompt()
+    {
+        var text = _promptText.Trim();
+        if (string.IsNullOrWhiteSpace(text) || _isStreaming) return;
+
+        _promptText = "";
+        _chatMessages.Add(new ChatMessage { Role = "user", Content = text });
+        _isStreaming = true;
+        _streamingDelta = "";
+
+        try
+        {
+            var req = new AgyExecutionRequest
+            {
+                Prompt = text,
+                Model = _selectedModel,
+                EnableAgenticMode = _enableAgentic
+            };
+
+            await foreach (var item in AgyProcess.ExecutePromptStreamAsync(req))
+            {
+                if (!string.IsNullOrEmpty(item.TextDelta))
+                {
+                    _streamingDelta += item.TextDelta;
+                    await InvokeAsync(StateHasChanged);
+                }
+
+                if (item.Usage != null)
+                {
+                    _lastUsage = item.Usage;
+                }
+            }
+
+            _chatMessages.Add(new ChatMessage { Role = "assistant", Content = _streamingDelta });
+            _streamingDelta = "";
+        }
+        catch (Exception ex)
+        {
+            _chatMessages.Add(new ChatMessage { Role = "assistant", Content = $"Error: {ex.Message}" });
+            Snackbar.Add($"AGY Error: {ex.Message}", Severity.Error);
+        }
+        finally
+        {
+            _isStreaming = false;
+            await InvokeAsync(StateHasChanged);
+        }
+    }
+
+    private void ClearChat()
+    {
+        _chatMessages.Clear();
+        _streamingDelta = "";
+        _lastUsage = null;
+    }
+
+    private async Task CopyText(string text, string msg)
+    {
+        await JS.InvokeVoidAsync("navigator.clipboard.writeText", text);
+        Snackbar.Add(msg, Severity.Info);
+    }
+
+    private static string FormatTokens(long tokens)
+    {
+        if (tokens >= 1_000_000)
+            return $"{tokens / 1_000_000.0:0.0}M";
+        if (tokens >= 1_000)
+            return $"{tokens / 1_000.0:0.0}k";
+        return tokens.ToString("N0");
+    }
+
+    private static string GetRelativeTime(DateTime? dtUtc)
+    {
+        if (!dtUtc.HasValue) return "Never";
+        var diff = DateTime.UtcNow - dtUtc.Value;
+        if (diff.TotalSeconds < 60) return "Just now";
+        if (diff.TotalMinutes < 60) return $"{(int)diff.TotalMinutes}m ago";
+        if (diff.TotalHours < 24) return $"{(int)diff.TotalHours}h ago";
+        if (diff.TotalDays < 7) return $"{(int)diff.TotalDays}d ago";
+        return dtUtc.Value.ToLocalTime().ToString("MMM dd");
+    }
+
+    private string GetPythonSnippet() =>
+$@"from openai import OpenAI
+
+client = OpenAI(
+    base_url=""http://127.0.0.1:5200/v1"",
+    api_key=""{_selectedKeyForSnippet}""
+)
+
+response = client.chat.completions.create(
+    model=""{_selectedModel}"",
+    messages=[{{""role"": ""user"", ""content"": ""Hello from Python!""}}],
+    stream=True
+)
+
+for chunk in response:
+    if chunk.choices and chunk.choices[0].delta.content:
+        print(chunk.choices[0].delta.content, end="""", flush=True)";
+
+    private string GetTsSnippet() =>
+$@"import OpenAI from ""openai"";
+
+const openai = new OpenAI({{
+  baseURL: ""http://127.0.0.1:5200/v1"",
+  apiKey: ""{_selectedKeyForSnippet}"",
+}});
+
+async function main() {{
+  const stream = await openai.chat.completions.create({{
+    model: ""{_selectedModel}"",
+    messages: [{{ role: ""user"", content: ""Hello from TypeScript!"" }}],
+    stream: true,
+  }});
+
+  for await (const chunk of stream) {{
+    process.stdout.write(chunk.choices[0]?.delta?.content || """");
+  }}
+}}
+
+main();";
+
+    private string GetCurlSnippet() =>
+$@"curl -N -X POST http://127.0.0.1:5200/v1/chat/completions \
+  -H ""Content-Type: application/json"" \
+  -H ""Authorization: Bearer {_selectedKeyForSnippet}"" \
+  -d '{{
+    ""model"": ""{_selectedModel}"",
+    ""stream"": true,
+    ""messages"": [{{""role"": ""user"", ""content"": ""Hello from cURL!""}}]
+  }}'";
+
+    private string GetCSharpSnippet() =>
+$@"using System.Net.Http.Headers;
+using System.Text;
+using System.Text.Json;
+
+using var client = new HttpClient {{ BaseAddress = new Uri(""http://127.0.0.1:5200"") }};
+client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue(""Bearer"", ""{_selectedKeyForSnippet}"");
+
+var request = new {{
+    model = ""{_selectedModel}"",
+    messages = new[] {{ new {{ role = ""user"", content = ""Hello from C#!"" }} }}
+}};
+
+var response = await client.PostAsync(""/v1/chat/completions"", 
+    new StringContent(JsonSerializer.Serialize(request), Encoding.UTF8, ""application/json""));
+var content = await response.Content.ReadAsStringAsync();
+Console.WriteLine(content);";
+}
+

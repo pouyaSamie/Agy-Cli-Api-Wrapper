@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <base href="/" />
+    <title>AGY OpenAI Gateway</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link href="_content/MudBlazor/MudBlazor.min.css" rel="stylesheet" />
+    <style>
+        :root {
+            --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+            --bg-canvas: #080a0f;
+            --bg-surface: #10141e;
+            --bg-surface-elevated: #161b28;
+            --border-subtle: rgba(255, 255, 255, 0.06);
+            --border-hover: rgba(255, 255, 255, 0.12);
+            --border-accent: rgba(56, 189, 248, 0.35);
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            background-color: var(--bg-canvas);
+            color: #f1f5f9;
+            font-family: var(--font-sans);
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+            overflow-x: hidden;
+        }
+
+        /* Sleek custom scrollbars */
+        ::-webkit-scrollbar {
+            width: 6px;
+            height: 6px;
+        }
+        ::-webkit-scrollbar-track {
+            background: transparent;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #1e293b;
+            border-radius: 6px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: #334155;
+        }
+
+        /* Premium Card & Panel styling */
+        .saas-card {
+            background: var(--bg-surface) !important;
+            border: 1px solid var(--border-subtle) !important;
+            border-radius: 12px;
+            box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04), 0 4px 20px -2px rgba(0, 0, 0, 0.5);
+            transition: border-color 0.2s ease, transform 0.2s ease, box-shadow 0.2s ease;
+        }
+
+        .saas-card-interactive:hover {
+            border-color: var(--border-hover) !important;
+            transform: translateY(-1px);
+            box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 8px 24px -4px rgba(0, 0, 0, 0.6);
+        }
+
+        /* Metric cards */
+        .metric-tile {
+            background: linear-gradient(180deg, rgba(22, 27, 40, 0.8) 0%, rgba(16, 20, 30, 0.95) 100%) !important;
+            border: 1px solid var(--border-subtle) !important;
+            border-radius: 12px;
+            box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
+            padding: 18px 20px;
+            transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+        }
+
+        .metric-tile:hover {
+            border-color: rgba(56, 189, 248, 0.3) !important;
+            box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08), 0 8px 20px -4px rgba(0, 0, 0, 0.6), 0 0 16px -4px rgba(56, 189, 248, 0.12);
+        }
+
+        @@media (max-width: 600px) {
+            .metric-tile {
+                padding: 10px 12px !important;
+                border-radius: 10px;
+            }
+        }
+
+        /* Pulsing status dot */
+        .pulse-dot {
+            display: inline-block;
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            background-color: #10b981;
+            box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7);
+            animation: pulse-ring 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+        }
+
+        @@keyframes pulse-ring {
+            0% {
+                transform: scale(0.95);
+                box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7);
+            }
+            70% {
+                transform: scale(1);
+                box-shadow: 0 0 0 6px rgba(16, 185, 129, 0);
+            }
+            100% {
+                transform: scale(0.95);
+                box-shadow: 0 0 0 0 rgba(16, 185, 129, 0);
+            }
+        }
+
+        /* Monospace elements */
+        code, pre, .font-mono {
+            font-family: var(--font-mono) !important;
+            font-variant-numeric: tabular-nums;
+        }
+
+        /* Badges & Chips */
+        .token-badge {
+            font-family: var(--font-mono);
+            font-size: 0.76rem;
+            font-weight: 600;
+            padding: 2px 8px;
+            border-radius: 6px;
+            background: rgba(56, 189, 248, 0.08);
+            color: #38bdf8;
+            border: 1px solid rgba(56, 189, 248, 0.2);
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            white-space: nowrap;
+        }
+
+        .token-badge-purple {
+            background: rgba(168, 85, 247, 0.08);
+            color: #c084fc;
+            border-color: rgba(168, 85, 247, 0.2);
+        }
+
+        .token-badge-success {
+            background: rgba(16, 185, 129, 0.08);
+            color: #34d399;
+            border-color: rgba(16, 185, 129, 0.2);
+        }
+
+        .token-badge-amber {
+            background: rgba(245, 158, 11, 0.08);
+            color: #fbbf24;
+            border-color: rgba(245, 158, 11, 0.2);
+        }
+
+        /* Nav Pills */
+        .nav-pill {
+            padding: 8px 16px;
+            border-radius: 8px;
+            font-size: 0.85rem;
+            font-weight: 500;
+            color: #94a3b8;
+            cursor: pointer;
+            transition: all 0.15s ease;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            user-select: none;
+            border: 1px solid transparent;
+        }
+
+        .nav-pill:hover {
+            color: #f1f5f9;
+            background: rgba(255, 255, 255, 0.04);
+        }
+
+        .nav-pill.active {
+            color: #38bdf8;
+            background: rgba(56, 189, 248, 0.1);
+            border-color: rgba(56, 189, 248, 0.2);
+            font-weight: 600;
+        }
+
+        /* MudBlazor clean overrides */
+        .mud-table-root {
+            font-family: var(--font-sans) !important;
+            background: transparent !important;
+        }
+
+        .mud-table-head {
+            background-color: rgba(16, 20, 30, 0.95) !important;
+        }
+
+        .mud-table-head th {
+            font-size: 0.72rem !important;
+            font-weight: 700 !important;
+            letter-spacing: 0.06em !important;
+            text-transform: uppercase !important;
+            color: #64748b !important;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.06) !important;
+            padding: 12px 16px !important;
+        }
+
+        .mud-table-body td {
+            border-bottom: 1px solid rgba(255, 255, 255, 0.04) !important;
+            padding: 12px 16px !important;
+            font-size: 0.85rem !important;
+            vertical-align: middle !important;
+        }
+
+        .mud-table-row:hover {
+            background-color: rgba(255, 255, 255, 0.02) !important;
+        }
+
+        /* Code block styling */
+        .code-container {
+            background: #06080d;
+            border: 1px solid rgba(255, 255, 255, 0.06);
+            border-radius: 8px;
+            font-family: var(--font-mono);
+            padding: 16px;
+            overflow-x: auto;
+            position: relative;
+        }
+    </style>
+    <HeadOutlet @rendermode="InteractiveServer" />
+</head>
+
+<body>
+    <Routes @rendermode="InteractiveServer" />
+    <script src="_framework/blazor.web.js"></script>
+    <script src="_content/MudBlazor/MudBlazor.min.js"></script>
+</body>
+
+</html>

@@ -1,0 +1,144 @@
+@inject IApiKeyManager ApiKeyManager
+@inject ISnackbar Snackbar
+@inject IJSRuntime JS
+
+<MudDialog Style="background: #0f172a;">
+    <DialogContent>
+        @if (_createdKey == null)
+        {
+            <div class="mb-4">
+                <MudText Typo="Typo.h6" Class="font-weight-bold" Style="color: #f8fafc; letter-spacing: -0.02em;">Create New API Key</MudText>
+                <MudText Typo="Typo.body2" Style="color: #94a3b8;" Class="mt-1">
+                    Generate a secure Bearer token to connect your local IDE, chat interface, or custom agent to AGY.
+                </MudText>
+            </div>
+
+            <MudTextField @bind-Value="_keyName"
+                          Label="Key Name / Client Description"
+                          Placeholder="e.g. Cursor IDE, LibreChat, Agent Worker"
+                          Variant="Variant.Outlined"
+                          FullWidth="true"
+                          AutoFocus="true"
+                          Class="mb-3" />
+
+            <div class="mb-2">
+                <MudText Typo="Typo.caption" Style="color: #64748b; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em;">
+                    Suggested Names:
+                </MudText>
+                <div class="d-flex flex-wrap gap-1 mt-1">
+                    @foreach (var suggestion in _suggestions)
+                    {
+                        <MudChip T="string"
+                                 Size="Size.Small"
+                                 Variant="Variant.Outlined"
+                                 Style="cursor: pointer; border-color: #334155; color: #cbd5e1; font-size: 0.75rem;"
+                                 OnClick="@(() => _keyName = suggestion)">
+                            @suggestion
+                        </MudChip>
+                    }
+                </div>
+            </div>
+        }
+        else
+        {
+            <div class="mb-3">
+                <div class="d-flex align-center gap-2 mb-2">
+                    <MudIcon Icon="@Icons.Material.Filled.CheckCircle" Color="Color.Success" Size="Size.Medium" />
+                    <MudText Typo="Typo.h6" Class="font-weight-bold" Style="color: #f8fafc;">API Key Generated</MudText>
+                </div>
+                <MudAlert Severity="Severity.Warning" Variant="Variant.Outlined" Class="mb-3" Dense="true">
+                    Please copy this secret key now. For security purposes, you will not be able to view it in plain text again.
+                </MudAlert>
+            </div>
+
+            <div class="pa-3 mb-4 d-flex align-center justify-space-between" style="background: #090d16; border: 1px solid rgba(56, 189, 248, 0.4); border-radius: 8px; box-shadow: 0 0 15px rgba(56, 189, 248, 0.1);">
+                <span style="font-family: var(--font-mono); font-size: 0.9rem; color: #38bdf8; font-weight: 600; word-break: break-all;">
+                    @_createdKey.Key
+                </span>
+                <MudIconButton Icon="@Icons.Material.Filled.ContentCopy" Color="Color.Primary" OnClick="CopyKey" aria-label="Copy API Key" />
+            </div>
+
+            <MudText Typo="Typo.caption" Style="color: #94a3b8; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em;" Class="d-block mb-1">
+                Quick Test cURL:
+            </MudText>
+            <div class="pa-2 d-flex align-center justify-space-between" style="background: #090d16; border: 1px solid #1e293b; border-radius: 6px; font-family: var(--font-mono); font-size: 0.75rem; color: #94a3b8;">
+                <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
+                    curl http://127.0.0.1:5200/v1/models -H "Authorization: Bearer @_createdKey.Key"
+                </span>
+                <MudIconButton Icon="@Icons.Material.Filled.ContentCopy" Size="Size.Small" Style="color: #64748b;" OnClick="@(() => CopyCurlSnippet(_createdKey.Key))" aria-label="Copy cURL Command" />
+            </div>
+        }
+    </DialogContent>
+    <DialogActions>
+        <div class="d-flex justify-end gap-2 w-100 pa-3" style="border-top: 1px solid rgba(255, 255, 255, 0.06);">
+            @if (_createdKey == null)
+            {
+                <MudButton OnClick="Cancel" Variant="Variant.Text" Style="color: #94a3b8;">Cancel</MudButton>
+                <MudButton Color="Color.Primary" Variant="Variant.Filled" OnClick="Submit" Disabled="_isSubmitting" Style="font-weight: 600;">
+                    @if (_isSubmitting)
+                    {
+                        <MudProgressCircular Class="ms-n1" Size="Size.Small" Indeterminate="true" />
+                        <span class="ms-2">Generating...</span>
+                    }
+                    else
+                    {
+                        <span>Generate Key</span>
+                    }
+                </MudButton>
+            }
+            else
+            {
+                <MudButton Color="Color.Primary" Variant="Variant.Filled" OnClick="Close" Style="font-weight: 600;">Done</MudButton>
+            }
+        </div>
+    </DialogActions>
+</MudDialog>
+
+@code {
+    [CascadingParameter]
+    private IMudDialogInstance? MudDialog { get; set; }
+
+    private string _keyName = "";
+    private bool _isSubmitting;
+    private ApiKeyItem? _createdKey;
+
+    private readonly string[] _suggestions = ["Cursor IDE", "LibreChat", "Open WebUI", "Python Client", "Claude Dev / Cline", "Custom Agent"];
+
+    private async Task Submit()
+    {
+        _isSubmitting = true;
+        try
+        {
+            var name = string.IsNullOrWhiteSpace(_keyName) ? "API Key" : _keyName.Trim();
+            _createdKey = await ApiKeyManager.CreateKeyAsync(name);
+            Snackbar.Add("API Key created successfully!", Severity.Success);
+        }
+        catch (Exception ex)
+        {
+            Snackbar.Add($"Failed to create key: {ex.Message}", Severity.Error);
+        }
+        finally
+        {
+            _isSubmitting = false;
+        }
+    }
+
+    private async Task CopyKey()
+    {
+        if (_createdKey != null)
+        {
+            await JS.InvokeVoidAsync("navigator.clipboard.writeText", _createdKey.Key);
+            Snackbar.Add("API key copied to clipboard!", Severity.Info);
+        }
+    }
+
+    private async Task CopyCurlSnippet(string key)
+    {
+        var cmd = $"curl http://127.0.0.1:5200/v1/models -H \"Authorization: Bearer {key}\"";
+        await JS.InvokeVoidAsync("navigator.clipboard.writeText", cmd);
+        Snackbar.Add("cURL test command copied!", Severity.Info);
+    }
+
+    private void Cancel() => MudDialog?.Cancel();
+    private void Close() => MudDialog?.Close(DialogResult.Ok(_createdKey));
+}

@@ -1,0 +1,81 @@
+@inherits LayoutComponentBase
+
+<MudThemeProvider IsDarkMode="true" Theme="_theme" />
+<MudPopoverProvider />
+<MudDialogProvider FullWidth="true" MaxWidth="MaxWidth.Small" CloseButton="true" />
+<MudSnackbarProvider />
+
+<MudLayout>
+    <MudAppBar Elevation="0" Dense="true" Fixed="false" Style="background: #0d1017; border-bottom: 1px solid rgba(255, 255, 255, 0.07); height: 56px; z-index: 100;">
+        <div class="d-flex align-center gap-2">
+            <div style="background: linear-gradient(135deg, #0284c7 0%, #6366f1 100%); padding: 6px; border-radius: 8px; display: flex; align-items: center; justify-content: center; box-shadow: 0 0 12px rgba(56, 189, 248, 0.25);">
+                <MudIcon Icon="@Icons.Material.Filled.Bolt" Size="Size.Small" Style="color: white;" />
+            </div>
+            <div class="d-flex align-center gap-2">
+                <MudText Typo="Typo.subtitle1" Style="font-weight: 700; letter-spacing: -0.02em; color: #f8fafc; white-space: nowrap;">AGY Gateway</MudText>
+                <span class="d-none d-sm-inline-block" style="font-size: 0.68rem; font-weight: 600; padding: 1px 6px; border-radius: 4px; background: rgba(56, 189, 248, 0.12); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.25);">v1</span>
+            </div>
+        </div>
+
+        <MudSpacer />
+
+        <div class="d-flex align-center gap-2 gap-sm-3">
+            <div class="d-flex align-center gap-1 gap-sm-2 px-2 px-sm-3 py-1" style="background: rgba(16, 185, 129, 0.08); border: 1px solid rgba(16, 185, 129, 0.2); border-radius: 20px;">
+                <span class="pulse-dot"></span>
+                <span class="d-none d-sm-inline" style="font-size: 0.76rem; font-weight: 600; color: #34d399; font-family: var(--font-mono); white-space: nowrap;">127.0.0.1:5200</span>
+                <span class="d-inline d-sm-none" style="font-size: 0.72rem; font-weight: 600; color: #34d399; font-family: var(--font-mono); white-space: nowrap;">:5200</span>
+            </div>
+
+            <div class="d-none d-md-flex align-center">
+                <MudTooltip Text="Local OpenAI Base URL">
+                    <span style="font-size: 0.72rem; color: #64748b; font-family: var(--font-mono); background: rgba(255, 255, 255, 0.03); border: 1px solid rgba(255, 255, 255, 0.06); padding: 4px 10px; border-radius: 6px;">
+                        /v1/chat/completions
+                    </span>
+                </MudTooltip>
+            </div>
+        </div>
+    </MudAppBar>
+
+    <MudMainContent Class="pb-16">
+        <MudContainer MaxWidth="MaxWidth.ExtraLarge" Class="px-3 px-sm-6 px-lg-8 pt-6">
+            @Body
+        </MudContainer>
+    </MudMainContent>
+</MudLayout>
+
+@code {
+    private MudTheme _theme = new MudTheme()
+    {
+        PaletteDark = new PaletteDark()
+        {
+            Primary = "#38bdf8",
+            PrimaryContrastText = "#090d16",
+            Secondary = "#a78bfa",
+            SecondaryContrastText = "#090d16",
+            Tertiary = "#34d399",
+            Background = "#090d16",
+            Surface = "#0f172a",
+            AppbarBackground = "#0f172a",
+            DrawerBackground = "#0f172a",
+            TextPrimary = "#f1f5f9",
+            TextSecondary = "#94a3b8",
+            TableLines = "rgba(255, 255, 255, 0.07)",
+            Divider = "rgba(255, 255, 255, 0.08)",
+            ActionDefault = "#94a3b8",
+            ActionDisabled = "#475569",
+            ActionDisabledBackground = "#1e293b",
+            LinesDefault = "rgba(255, 255, 255, 0.08)",
+            Info = "#38bdf8",
+            Success = "#10b981",
+            Warning = "#f59e0b",
+            Error = "#f43f5e"
+        },
+        Typography = new Typography()
+        {
+            Default = new DefaultTypography()
+            {
+                FontFamily = ["Inter", "-apple-system", "BlinkMacSystemFont", "Segoe UI", "Roboto", "sans-serif"]
+            }
+        }
+    };
+}
