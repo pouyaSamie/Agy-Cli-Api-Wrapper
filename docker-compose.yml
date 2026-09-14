@@ -1,0 +1,21 @@
+services:
+  agy-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: agy-openai-api
+    ports:
+      - "5200:5200"
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Production
+      - Agy__Port=5200
+      - Agy__WorkspaceDirectory=/workspace
+      - Agy__DatabasePath=/app/data/agy_gateway.db
+    volumes:
+      # Mount persistent SQLite database and keys
+      - ./data:/app/data
+      # Mount local AGY configuration and credentials
+      - ~/.gemini:/root/.gemini
+      # Mount local workspace
+      - ./workspace:/workspace
+    restart: unless-stopped
