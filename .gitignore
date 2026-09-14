@@ -1,0 +1,42 @@
+## .NET Core & Build Artifacts
+bin/
+obj/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+## Visual Studio / VS Code / JetBrains Rider
+.vs/
+.vscode/
+.idea/
+visual studio 18/
+
+## Data, Databases & Secrets (Keys)
+data/
+**/data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+keys.json
+**/keys.json
+*.key
+*.pem
+*.token
+.env
+.env.*
+
+## PowerShell scripts (per user request)
+*.ps1
+
+## Workspace, Tests & Local Files
+workspace/
+**/workspace/
+test_flag.txt
+
+## Logs & Temp files
+*.log
+scratch/
+test-cli.log
