@@ -5,17 +5,24 @@ services:
       dockerfile: Dockerfile
     container_name: agy-openai-api
     ports:
-      - "5200:5200"
+      # Bind to localhost on the host by default; expose externally only behind a reverse proxy with Agy__AdminApiKey set
+      - "127.0.0.1:5200:5200"
     environment:
       - ASPNETCORE_ENVIRONMENT=Production
       - Agy__Port=5200
+      - Agy__ExecutablePath=/usr/local/bin/agy
       - Agy__WorkspaceDirectory=/workspace
       - Agy__DatabasePath=/app/data/agy_gateway.db
+      - Agy__AdminApiKey=${AGY_ADMIN_API_KEY:-}
     volumes:
-      # Mount persistent SQLite database and keys
+      # Mount the host agy CLI binary read-only into the container
+      - ${AGY_BIN_PATH:-/usr/local/bin/agy}:/usr/local/bin/agy:ro
+      # Mount persistent SQLite database
       - ./data:/app/data
-      # Mount local AGY configuration and credentials
-      - ~/.gemini:/root/.gemini
-      # Mount local workspace
+      # Mount local AGY configuration and credentials for the non-root app user
+      - ~/.gemini:/home/app/.gemini
+      # Mount isolated workspace directory
       - ./workspace:/workspace
+    mem_limit: 2g
+    pids_limit: 256
     restart: unless-stopped
