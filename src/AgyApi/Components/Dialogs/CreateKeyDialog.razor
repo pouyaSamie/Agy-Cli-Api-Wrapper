@@ -1,6 +1,7 @@
 @inject IApiKeyManager ApiKeyManager
 @inject ISnackbar Snackbar
 @inject IJSRuntime JS
+@inject NavigationManager Navigation
 
 <MudDialog Style="background: #0f172a;">
     <DialogContent>
@@ -63,7 +64,7 @@
             </MudText>
             <div class="pa-2 d-flex align-center justify-space-between" style="background: #090d16; border: 1px solid #1e293b; border-radius: 6px; font-family: var(--font-mono); font-size: 0.75rem; color: #94a3b8;">
                 <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
-                    curl http://127.0.0.1:5200/v1/models -H "Authorization: Bearer @_createdKey.Key"
+                    curl @($"{Navigation.BaseUri.TrimEnd('/')}/v1/models") -H "Authorization: Bearer @_createdKey.Key"
                 </span>
                 <MudIconButton Icon="@Icons.Material.Filled.ContentCopy" Size="Size.Small" Style="color: #64748b;" OnClick="@(() => CopyCurlSnippet(_createdKey.Key))" aria-label="Copy cURL Command" />
             </div>
@@ -134,7 +135,7 @@
 
     private async Task CopyCurlSnippet(string key)
     {
-        var cmd = $"curl http://127.0.0.1:5200/v1/models -H \"Authorization: Bearer {key}\"";
+        var cmd = $"curl {Navigation.BaseUri.TrimEnd('/')}/v1/models -H \"Authorization: Bearer {key}\"";
         await JS.InvokeVoidAsync("navigator.clipboard.writeText", cmd);
         Snackbar.Add("cURL test command copied!", Severity.Info);
     }

@@ -1,24 +1,29 @@
-using AgyApi.Configuration;
 using AgyApi.Features.ApiKeys;
 using AgyApi.Features.Models;
 using AgyApi.Features.Sessions;
-using Microsoft.Extensions.Options;
+using AgyApi.Infrastructure.Agy;
 
 namespace AgyApi.Infrastructure.Background;
 
 public class AgyBackgroundService : BackgroundService
 {
-    private readonly IServiceProvider _services;
+    private readonly IModelRegistryService _modelRegistry;
+    private readonly IApiKeyManager _apiKeyManager;
+    private readonly ISessionManager _sessionManager;
+    private readonly IAgyWorkerPool _workerPool;
     private readonly ILogger<AgyBackgroundService> _logger;
-    private readonly AgyOptions _options;
 
     public AgyBackgroundService(
-        IServiceProvider services,
-        IOptions<AgyOptions> options,
+        IModelRegistryService modelRegistry,
+        IApiKeyManager apiKeyManager,
+        ISessionManager sessionManager,
+        IAgyWorkerPool workerPool,
         ILogger<AgyBackgroundService> logger)
     {
-        _services = services;
-        _options = options.Value;
+        _modelRegistry = modelRegistry;
+        _apiKeyManager = apiKeyManager;
+        _sessionManager = sessionManager;
+        _workerPool = workerPool;
         _logger = logger;
     }
 
@@ -29,15 +34,18 @@ public class AgyBackgroundService : BackgroundService
         // Warm-up phase
         try
         {
-            using var scope = _services.CreateScope();
-            var modelRegistry = scope.ServiceProvider.GetRequiredService<IModelRegistryService>();
-            var apiKeyManager = scope.ServiceProvider.GetRequiredService<IApiKeyManager>();
+            await _apiKeyManager.InitializeAsync();
+            await _modelRegistry.InitializeAsync(stoppingToken);
 
-            await apiKeyManager.InitializeAsync();
-            await modelRegistry.InitializeAsync(stoppingToken);
+            var models = _modelRegistry.GetDiscoveredModels();
+            _logger.LogInformation("Model discovery warm-up complete. Discovered {Count} models.", models.Count);
 
-            var models = modelRegistry.GetDiscoveredModels();
-            _logger.LogInformation("AGY Background Hosted Service warm-up complete. Discovered {Count} models.", models.Count);
+            await _workerPool.WarmUpAsync(stoppingToken);
+            _logger.LogInformation("Worker pool startup warm-up complete. Active workers: {Count}", _workerPool.GetStats().TotalWorkers);
+        }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
+            return;
         }
         catch (Exception ex)
         {
@@ -46,21 +54,26 @@ public class AgyBackgroundService : BackgroundService
 
         // Maintenance loop (runs periodically while application is active)
         using var timer = new PeriodicTimer(TimeSpan.FromMinutes(10));
-        while (!stoppingToken.IsCancellationRequested && await timer.WaitForNextTickAsync(stoppingToken))
+        while (!stoppingToken.IsCancellationRequested)
         {
             try
             {
-                using var scope = _services.CreateScope();
-                var sessionManager = scope.ServiceProvider.GetRequiredService<ISessionManager>();
+                if (!await timer.WaitForNextTickAsync(stoppingToken))
+                {
+                    break;
+                }
 
-                // Cleanup sessions inactive for > 12 hours
-                var cleaned = sessionManager.CleanupExpiredSessions(TimeSpan.FromHours(12));
+                var cleaned = _sessionManager.CleanupExpiredSessions(TimeSpan.FromHours(12));
                 if (cleaned > 0)
                 {
                     _logger.LogInformation("Cleaned up {Count} expired conversation sessions.", cleaned);
                 }
             }
-            catch (Exception ex) when (ex is not OperationCanceledException)
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (Exception ex)
             {
                 _logger.LogWarning(ex, "Error occurred during background maintenance cycle.");
             }

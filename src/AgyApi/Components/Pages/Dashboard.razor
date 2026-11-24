@@ -1,4 +1,9 @@
 @page "/"
+@implements IDisposable
+@using System.Diagnostics
+@using System.Text
+@using AgyApi.Configuration
+@using Microsoft.Extensions.Options
 @inject IModelRegistryService ModelRegistry
 @inject IApiKeyManager ApiKeyManager
 @inject IAgyProcessService AgyProcess
@@ -6,6 +11,8 @@
 @inject IDialogService DialogService
 @inject ISnackbar Snackbar
 @inject IJSRuntime JS
+@inject NavigationManager Navigation
+@inject IOptions<AgyOptions> AgyOptionsAccessor
 
 <!-- Page Header -->
 <div class="d-flex flex-column flex-sm-row justify-space-between align-start align-sm-center gap-3 mb-6">
@@ -466,6 +473,13 @@
                                     <div class="d-flex align-center justify-space-between mb-1" style="font-size: 0.68rem; text-transform: uppercase; font-weight: 700; color: @(isUser ? "#bae6fd" : "#38bdf8");">
                                         <span>@(isUser ? "You" : "Assistant")</span>
                                     </div>
+                                    @if (!isUser && !string.IsNullOrWhiteSpace(msg.ReasoningContent))
+                                    {
+                                        <details class="mb-2" style="font-size: 0.78rem; color: #94a3b8; background: rgba(255, 255, 255, 0.03); border-radius: 6px; padding: 6px 8px;">
+                                            <summary style="cursor: pointer; font-weight: 600; color: #cbd5e1;">Thinking</summary>
+                                            <div style="margin-top: 4px; white-space: pre-wrap; word-break: break-word;">@msg.ReasoningContent</div>
+                                        </details>
+                                    }
                                     <div style="font-size: 0.85rem; line-height: 1.5; white-space: pre-wrap; word-break: break-word;">@msg.Content</div>
                                 </div>
                             </div>
@@ -540,10 +554,17 @@
                     <div class="pa-3" style="background: rgba(255, 255, 255, 0.02); border: 1px solid rgba(255, 255, 255, 0.05); border-radius: 8px;">
                         <div class="d-flex align-center justify-space-between mb-1">
                             <span style="font-weight: 600; font-size: 0.82rem; color: #f8fafc;">Agentic Tool Execution</span>
-                            <MudSwitch T="bool" @bind-Value="_enableAgentic" Color="Color.Warning" />
+                            <MudSwitch T="bool" @bind-Value="_enableAgentic" Color="Color.Warning" Disabled="@(!AllowAgenticTools)" />
                         </div>
                         <MudText Typo="Typo.caption" Style="color: #64748b; line-height: 1.4;" Class="d-block">
-                            Permits AGY to run workspace shell commands and edit local files (<code>--dangerously-skip-permissions</code>).
+                            @if (AllowAgenticTools)
+                            {
+                                <span>Permits AGY to run workspace shell commands and edit local files (<code>--dangerously-skip-permissions</code>).</span>
+                            }
+                            else
+                            {
+                                <span>Disabled by server policy (<code>Agy:AllowAgenticTools=false</code>). Workers run in restricted <code>--sandbox</code> mode.</span>
+                            }
                         </MudText>
                     </div>
 
@@ -660,7 +681,7 @@
                     Client Connection Guide
                 </MudText>
                 <MudText Typo="Typo.body2" Style="color: #64748b;">
-                    Point any OpenAI client to <code>http://127.0.0.1:5200/v1</code>. Select an active key to update code samples dynamically.
+                    Point any OpenAI client to <code>@($"{BaseUrl}/v1")</code>. Select an active key to update code samples dynamically.
                 </MudText>
             </div>
 
@@ -877,11 +898,17 @@
     private string _selectedKeyForSnippet = "YOUR_API_KEY";
 
     // Playground state
+    private readonly CancellationTokenSource _disposeCts = new();
     private string _promptText = "";
     private bool _isStreaming = false;
     private string _streamingDelta = "";
+    private string _playgroundSessionId = $"playground-{Guid.NewGuid():N}";
+    private string? _playgroundConversationId;
     private List<ChatMessage> _chatMessages = [];
     private AgyUsage? _lastUsage;
+
+    private bool AllowAgenticTools => AgyOptionsAccessor.Value.AllowAgenticTools;
+    private string BaseUrl => Navigation.BaseUri.TrimEnd('/');
 
     // KPI sums
     private long TotalTokensAcrossKeys => _keys.Sum(k => k.TotalTokens);
@@ -1004,21 +1031,54 @@
         _isStreaming = true;
         _streamingDelta = "";
 
+        string? streamError = null;
+        string? latestThinking = null;
+        string? fullResponse = null;
+        var streamBuilder = new StringBuilder();
+        var renderWatch = Stopwatch.StartNew();
+
         try
         {
             var req = new AgyExecutionRequest
             {
                 Prompt = text,
                 Model = _selectedModel,
-                EnableAgenticMode = _enableAgentic
+                SessionId = _playgroundSessionId,
+                ConversationId = _playgroundConversationId,
+                EnableAgenticMode = _enableAgentic && AllowAgenticTools
             };
 
-            await foreach (var item in AgyProcess.ExecutePromptStreamAsync(req))
+            await foreach (var item in AgyProcess.ExecutePromptStreamAsync(req, _disposeCts.Token))
             {
+                if (!string.IsNullOrEmpty(item.ConversationId))
+                {
+                    _playgroundConversationId = item.ConversationId;
+                }
+
                 if (!string.IsNullOrEmpty(item.TextDelta))
                 {
-                    _streamingDelta += item.TextDelta;
-                    await InvokeAsync(StateHasChanged);
+                    streamBuilder.Append(item.TextDelta);
+                    if (renderWatch.ElapsedMilliseconds >= 75)
+                    {
+                        _streamingDelta = streamBuilder.ToString();
+                        renderWatch.Restart();
+                        await InvokeAsync(StateHasChanged);
+                    }
+                }
+
+                if (!string.IsNullOrEmpty(item.Thinking))
+                {
+                    latestThinking = item.Thinking;
+                }
+
+                if (!string.IsNullOrEmpty(item.FullResponse))
+                {
+                    fullResponse = item.FullResponse;
+                }
+
+                if (!string.IsNullOrEmpty(item.Error))
+                {
+                    streamError = item.Error;
                 }
 
                 if (item.Usage != null)
@@ -1027,8 +1087,26 @@
                 }
             }
 
-            _chatMessages.Add(new ChatMessage { Role = "assistant", Content = _streamingDelta });
+            _streamingDelta = streamBuilder.ToString();
+
+            if (!string.IsNullOrEmpty(streamError))
+            {
+                var contentText = string.IsNullOrWhiteSpace(_streamingDelta)
+                    ? $"Error: {streamError}"
+                    : $"{_streamingDelta}\n\n[Error: {streamError}]";
+                _chatMessages.Add(new ChatMessage { Role = "assistant", Content = contentText, ReasoningContent = latestThinking });
+                Snackbar.Add($"AGY Error: {streamError}", Severity.Error);
+            }
+            else
+            {
+                var finalContent = !string.IsNullOrEmpty(_streamingDelta) ? _streamingDelta : (fullResponse ?? string.Empty);
+                _chatMessages.Add(new ChatMessage { Role = "assistant", Content = finalContent, ReasoningContent = latestThinking });
+            }
             _streamingDelta = "";
+        }
+        catch (OperationCanceledException) when (_disposeCts.IsCancellationRequested)
+        {
+            // Component disposed while streaming
         }
         catch (Exception ex)
         {
@@ -1038,8 +1116,17 @@
         finally
         {
             _isStreaming = false;
-            await InvokeAsync(StateHasChanged);
+            if (!_disposeCts.IsCancellationRequested)
+            {
+                await InvokeAsync(StateHasChanged);
+            }
         }
+    }
+
+    public void Dispose()
+    {
+        _disposeCts.Cancel();
+        _disposeCts.Dispose();
     }
 
     private void ClearChat()
@@ -1047,6 +1134,8 @@
         _chatMessages.Clear();
         _streamingDelta = "";
         _lastUsage = null;
+        _playgroundSessionId = $"playground-{Guid.NewGuid():N}";
+        _playgroundConversationId = null;
     }
 
     private async Task CopyText(string text, string msg)
@@ -1079,7 +1168,7 @@
 $@"from openai import OpenAI
 
 client = OpenAI(
-    base_url=""http://127.0.0.1:5200/v1"",
+    base_url=""{BaseUrl}/v1"",
     api_key=""{_selectedKeyForSnippet}""
 )
 
@@ -1097,7 +1186,7 @@ for chunk in response:
 $@"import OpenAI from ""openai"";
 
 const openai = new OpenAI({{
-  baseURL: ""http://127.0.0.1:5200/v1"",
+  baseURL: ""{BaseUrl}/v1"",
   apiKey: ""{_selectedKeyForSnippet}"",
 }});
 
@@ -1116,7 +1205,7 @@ async function main() {{
 main();";
 
     private string GetCurlSnippet() =>
-$@"curl -N -X POST http://127.0.0.1:5200/v1/chat/completions \
+$@"curl -N -X POST {BaseUrl}/v1/chat/completions \
   -H ""Content-Type: application/json"" \
   -H ""Authorization: Bearer {_selectedKeyForSnippet}"" \
   -d '{{
@@ -1130,7 +1219,7 @@ $@"using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 
-using var client = new HttpClient {{ BaseAddress = new Uri(""http://127.0.0.1:5200"") }};
+using var client = new HttpClient {{ BaseAddress = new Uri(""{BaseUrl}"") }};
 client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue(""Bearer"", ""{_selectedKeyForSnippet}"");
 
 var request = new {{

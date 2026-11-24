@@ -1,4 +1,5 @@
 @inherits LayoutComponentBase
+@inject NavigationManager Navigation
 
 <MudThemeProvider IsDarkMode="true" Theme="_theme" />
 <MudPopoverProvider />
@@ -22,8 +23,8 @@
         <div class="d-flex align-center gap-2 gap-sm-3">
             <div class="d-flex align-center gap-1 gap-sm-2 px-2 px-sm-3 py-1" style="background: rgba(16, 185, 129, 0.08); border: 1px solid rgba(16, 185, 129, 0.2); border-radius: 20px;">
                 <span class="pulse-dot"></span>
-                <span class="d-none d-sm-inline" style="font-size: 0.76rem; font-weight: 600; color: #34d399; font-family: var(--font-mono); white-space: nowrap;">127.0.0.1:5200</span>
-                <span class="d-inline d-sm-none" style="font-size: 0.72rem; font-weight: 600; color: #34d399; font-family: var(--font-mono); white-space: nowrap;">:5200</span>
+                <span class="d-none d-sm-inline" style="font-size: 0.76rem; font-weight: 600; color: #34d399; font-family: var(--font-mono); white-space: nowrap;">@HostAuthority</span>
+                <span class="d-inline d-sm-none" style="font-size: 0.72rem; font-weight: 600; color: #34d399; font-family: var(--font-mono); white-space: nowrap;">:@HostPort</span>
             </div>
 
             <div class="d-none d-md-flex align-center">
@@ -44,6 +45,10 @@
 </MudLayout>
 
 @code {
+    private Uri CurrentUri => new(Navigation.BaseUri);
+    private string HostAuthority => CurrentUri.Authority;
+    private int HostPort => CurrentUri.Port;
+
     private MudTheme _theme = new MudTheme()
     {
         PaletteDark = new PaletteDark()
