@@ -13,48 +13,58 @@ public class AgyWorker : IAgyWorker
     private readonly string _model;
     private readonly string _effort;
     private readonly string? _initialConversationId;
+    private readonly bool _enableAgentic;
     private readonly AgyOptions _options;
     private readonly IAgyTranscriptReader _transcriptReader;
     private readonly ILogger<AgyWorker> _logger;
     private readonly SemaphoreSlim _turnLock = new(1, 1);
+    private readonly CancellationTokenSource _workerCts = new();
+    private readonly object _stderrLock = new();
+    private readonly StringBuilder _recentStderr = new();
 
     private Process? _process;
+    private int _processId;
     private StreamWriter? _stdin;
     private StreamReader? _stdout;
     private string? _currentConversationId;
     private int _turnCount;
-    private DateTime _createdUtc;
+    private readonly DateTime _createdUtc;
     private DateTime _lastActiveUtc;
     private volatile bool _isHealthy;
     private volatile bool _isBusy;
-    private bool _disposed;
+    private int _disposed;
 
     public string Id => _id;
-    public int ProcessId => _process?.Id ?? 0;
+    public int ProcessId => Volatile.Read(ref _processId);
     public string? CurrentConversationId => _currentConversationId;
     public string Model => _model;
     public string Effort => _effort;
-    public int TurnCount => _turnCount;
+    public bool EnableAgenticMode => _enableAgentic;
+    public int TurnCount => Volatile.Read(ref _turnCount);
     public DateTime CreatedUtc => _createdUtc;
     public DateTime LastActiveUtc => _lastActiveUtc;
-    public bool IsHealthy => _isHealthy && _process != null && !_process.HasExited;
+    public bool IsHealthy => Volatile.Read(ref _disposed) == 0 && _isHealthy && IsProcessAlive();
     public bool IsBusy => _isBusy;
 
     public long WorkingSetBytes
     {
         get
         {
+            if (Volatile.Read(ref _disposed) != 0) return 0;
+            var proc = Volatile.Read(ref _process);
+            if (proc == null) return 0;
+
             try
             {
-                if (_process != null && !_process.HasExited)
+                if (!proc.HasExited)
                 {
-                    _process.Refresh();
-                    return _process.WorkingSet64;
+                    proc.Refresh();
+                    return proc.WorkingSet64;
                 }
             }
             catch
             {
-                // ignored
+                // Process exited or disposed concurrently
             }
             return 0;
         }
@@ -67,125 +77,152 @@ public class AgyWorker : IAgyWorker
         string? conversationId,
         IOptions<AgyOptions> options,
         IAgyTranscriptReader transcriptReader,
-        ILogger<AgyWorker> logger)
+        ILogger<AgyWorker> logger,
+        bool enableAgentic = false)
     {
         _id = id;
         _model = model;
         _effort = effort;
         _initialConversationId = conversationId;
         _options = options.Value;
+        _enableAgentic = enableAgentic && _options.AllowAgenticTools;
         _transcriptReader = transcriptReader;
         _logger = logger;
         _createdUtc = DateTime.UtcNow;
         _lastActiveUtc = DateTime.UtcNow;
     }
 
+    private bool IsProcessAlive()
+    {
+        var proc = Volatile.Read(ref _process);
+        if (proc == null) return false;
+
+        try
+        {
+            return !proc.HasExited;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     public async Task InitializeAsync(CancellationToken cancellationToken = default)
     {
-        var workspaceDir = Path.GetFullPath(_options.WorkspaceDirectory);
-        if (!Directory.Exists(workspaceDir))
-        {
-            Directory.CreateDirectory(workspaceDir);
-        }
+        var psi = AgyProcessHelpers.BuildCliProcessStartInfo(
+            _options,
+            _model,
+            _effort,
+            _initialConversationId,
+            _enableAgentic,
+            streamJsonInput: true);
 
-        var exePath = _options.ExecutablePath;
-        if (string.Equals(exePath, "agy", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(exePath, "agy.exe", StringComparison.OrdinalIgnoreCase))
-        {
-            var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-            var candidate = Path.Combine(localAppData, "agy", "bin", "agy.exe");
-            if (File.Exists(candidate))
-            {
-                exePath = candidate;
-            }
-        }
+        _logger.LogInformation("Starting persistent AgyWorker {Id} for model {Model}, effort {Effort}, agentic {Agentic}",
+            _id, _model, _effort, _enableAgentic);
 
-        var psi = new ProcessStartInfo
-        {
-            FileName = exePath,
-            UseShellExecute = false,
-            RedirectStandardInput = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            StandardInputEncoding = new UTF8Encoding(false),
-            StandardOutputEncoding = new UTF8Encoding(false),
-            StandardErrorEncoding = new UTF8Encoding(false),
-            CreateNoWindow = true,
-            WindowStyle = ProcessWindowStyle.Hidden,
-            WorkingDirectory = workspaceDir
-        };
-
-        psi.ArgumentList.Add("--input-format");
-        psi.ArgumentList.Add("stream-json");
-        psi.ArgumentList.Add("--output-format");
-        psi.ArgumentList.Add("stream-json");
-        psi.ArgumentList.Add("--model");
-        psi.ArgumentList.Add(_model);
-
-        var hasEffortTier = _model.EndsWith("-high", StringComparison.OrdinalIgnoreCase) ||
-                            _model.EndsWith("-medium", StringComparison.OrdinalIgnoreCase) ||
-                            _model.EndsWith("-low", StringComparison.OrdinalIgnoreCase);
-
-        var isClaude = _model.Contains("claude", StringComparison.OrdinalIgnoreCase);
-
-        if (!hasEffortTier && !isClaude && !string.IsNullOrWhiteSpace(_effort))
-        {
-            psi.ArgumentList.Add("--effort");
-            psi.ArgumentList.Add(_effort.ToLowerInvariant());
-        }
-
-        if (!string.IsNullOrWhiteSpace(_initialConversationId))
-        {
-            psi.ArgumentList.Add("--conversation");
-            psi.ArgumentList.Add(_initialConversationId);
-        }
-
-        psi.ArgumentList.Add("--dangerously-skip-permissions");
-        psi.ArgumentList.Add("--disable-slash-commands");
-        psi.ArgumentList.Add("--print-timeout");
-        psi.ArgumentList.Add($"{_options.PrintTimeoutMinutes}m0s");
-
-        _logger.LogInformation("Starting persistent AgyWorker {Id} for model {Model}, effort {Effort}",
-            _id, _model, _effort);
-
-        _process = new Process { StartInfo = psi };
-        _process.ErrorDataReceived += (_, e) =>
+        var proc = new Process { StartInfo = psi };
+        proc.ErrorDataReceived += (_, e) =>
         {
             if (!string.IsNullOrEmpty(e.Data))
             {
+                AppendStderr(e.Data);
                 _logger.LogWarning("[Worker {Id} stderr] {Data}", _id, e.Data);
             }
         };
 
-        _process.Start();
-        _process.BeginErrorReadLine();
+        try
+        {
+            proc.Start();
+        }
+        catch
+        {
+            proc.Dispose();
+            throw;
+        }
 
-        _stdin = _process.StandardInput;
-        _stdout = _process.StandardOutput;
+        Volatile.Write(ref _process, proc);
+        Volatile.Write(ref _processId, proc.Id);
+        proc.BeginErrorReadLine();
+
+        _stdin = proc.StandardInput;
+        _stdout = proc.StandardOutput;
 
         try
         {
-            using var initCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            using var initCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _workerCts.Token);
             initCts.CancelAfter(TimeSpan.FromSeconds(20));
 
-            var firstLine = await _stdout.ReadLineAsync(initCts.Token);
-            if (!string.IsNullOrWhiteSpace(firstLine))
+            bool receivedInit = false;
+            while (!initCts.Token.IsCancellationRequested)
             {
-                using var doc = JsonDocument.Parse(firstLine);
-                if (doc.RootElement.TryGetProperty("conversation_id", out var convProp))
+                var line = await _stdout.ReadLineAsync(initCts.Token);
+                if (line == null)
                 {
-                    _currentConversationId = convProp.GetString();
+                    break;
+                }
+
+                if (string.IsNullOrWhiteSpace(line))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    using var doc = JsonDocument.Parse(line);
+                    if (doc.RootElement.TryGetProperty("conversation_id", out var convProp))
+                    {
+                        _currentConversationId = convProp.GetString();
+                    }
+
+                    if (doc.RootElement.TryGetProperty("event", out var eventProp) &&
+                        string.Equals(eventProp.GetString(), "init", StringComparison.OrdinalIgnoreCase))
+                    {
+                        receivedInit = true;
+                        break;
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(_currentConversationId))
+                    {
+                        receivedInit = true;
+                        break;
+                    }
+                }
+                catch (JsonException)
+                {
+                    _logger.LogDebug("[Worker {Id}] Non-JSON startup line: {Line}", _id, line);
                 }
             }
 
+            if (!receivedInit || proc.HasExited)
+            {
+                try
+                {
+                    using var exitCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                    exitCts.CancelAfter(TimeSpan.FromSeconds(2));
+                    await proc.WaitForExitAsync(exitCts.Token);
+                }
+                catch
+                {
+                    // ignored
+                }
+
+                var exitInfo = proc.HasExited ? $"exit code {proc.ExitCode}" : "unexpected stdout EOF";
+                var errText = GetRecentStderr();
+                var message = string.IsNullOrWhiteSpace(errText)
+                    ? $"AGY worker {_id} failed to initialize ({exitInfo})."
+                    : $"AGY worker {_id} failed to initialize ({exitInfo}): {errText}";
+
+                throw new InvalidOperationException(message);
+            }
+
             _isHealthy = true;
-            _logger.LogInformation("Persistent AgyWorker {Id} successfully initialized with PID {Pid}, conversation {Conv}",
-                _id, _process.Id, _currentConversationId ?? "none");
+            _logger.LogInformation("Persistent AgyWorker {Id} initialized with PID {Pid}, conversation {Conv}, agentic {Agentic}",
+                _id, _processId, _currentConversationId ?? "none", _enableAgentic);
         }
         catch (Exception ex)
         {
             _isHealthy = false;
-            _logger.LogError(ex, "Failed to initialize AgyWorker {Id} on PID {Pid}", _id, _process.Id);
+            _logger.LogError(ex, "Failed to initialize AgyWorker {Id} on PID {Pid}", _id, _processId);
             await TerminateAsync();
             throw;
         }
@@ -205,13 +242,18 @@ public class AgyWorker : IAgyWorker
             yield break;
         }
 
-        await _turnLock.WaitAsync(cancellationToken);
+        using var turnCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _workerCts.Token);
+        turnCts.CancelAfter(TimeSpan.FromMinutes(Math.Max(1, _options.PrintTimeoutMinutes)));
+        var turnToken = turnCts.Token;
+
+        await _turnLock.WaitAsync(turnToken);
         _isBusy = true;
         _lastActiveUtc = DateTime.UtcNow;
 
         var responseBuilder = new StringBuilder();
         AgyUsage? lastUsage = null;
         var hasReceivedResult = false;
+        var turnCompletedNormally = false;
 
         try
         {
@@ -225,13 +267,13 @@ public class AgyWorker : IAgyWorker
             };
 
             var jsonLine = JsonSerializer.Serialize(inputEvent);
-            await _stdin.WriteLineAsync(jsonLine.AsMemory(), cancellationToken);
-            await _stdin.FlushAsync(cancellationToken);
+            await _stdin.WriteLineAsync(jsonLine.AsMemory(), turnToken);
+            await _stdin.FlushAsync(turnToken);
 
             string? line;
-            while ((line = await _stdout.ReadLineAsync(cancellationToken)) != null)
+            while ((line = await _stdout.ReadLineAsync(turnToken)) != null)
             {
-                if (cancellationToken.IsCancellationRequested) break;
+                if (turnToken.IsCancellationRequested) break;
                 if (string.IsNullOrWhiteSpace(line)) continue;
 
                 AgyRawEvent? rawEvent = null;
@@ -247,7 +289,7 @@ public class AgyWorker : IAgyWorker
 
                 if (rawEvent == null) continue;
 
-                _logger.LogInformation("[Worker {Id}] Read line ({Len} chars): Event={Event}",
+                _logger.LogTrace("[Worker {Id}] Read line ({Len} chars): Event={Event}",
                     _id, line.Length, rawEvent.Event);
 
                 if (!string.IsNullOrEmpty(rawEvent.ConversationId))
@@ -296,7 +338,7 @@ public class AgyWorker : IAgyWorker
                         if (result != null)
                         {
                             hasReceivedResult = true;
-                            _turnCount++;
+                            Interlocked.Increment(ref _turnCount);
                             _lastActiveUtc = DateTime.UtcNow;
 
                             if (!string.IsNullOrEmpty(result.ConversationId))
@@ -309,9 +351,9 @@ public class AgyWorker : IAgyWorker
                             }
 
                             string? transcriptThinking = null;
-                            if (!string.IsNullOrEmpty(_currentConversationId))
+                            if (_options.IncludeReasoningContent && !string.IsNullOrEmpty(_currentConversationId))
                             {
-                                transcriptThinking = await _transcriptReader.ExtractThinkingAsync(_currentConversationId, cancellationToken);
+                                transcriptThinking = await _transcriptReader.ExtractThinkingAsync(_currentConversationId, turnToken);
                             }
 
                             yield return new AgyStreamItem
@@ -329,6 +371,7 @@ public class AgyWorker : IAgyWorker
 
                 if (hasReceivedResult)
                 {
+                    turnCompletedNormally = true;
                     break;
                 }
             }
@@ -336,48 +379,85 @@ public class AgyWorker : IAgyWorker
             if (!hasReceivedResult)
             {
                 _isHealthy = false;
+                var errText = GetRecentStderr();
+                var message = string.IsNullOrWhiteSpace(errText)
+                    ? $"Worker {_id} reached stream EOF without returning a turn result."
+                    : $"Worker {_id} reached stream EOF without returning a turn result: {errText}";
+
                 yield return new AgyStreamItem
                 {
                     ConversationId = _currentConversationId,
                     IsComplete = true,
-                    Error = $"Worker {_id} reached stream EOF without returning a turn result."
+                    Error = message
                 };
             }
         }
         finally
         {
+            if (!turnCompletedNormally)
+            {
+                _isHealthy = false;
+            }
             _isBusy = false;
             _turnLock.Release();
         }
     }
 
+    private void AppendStderr(string line)
+    {
+        lock (_stderrLock)
+        {
+            if (_recentStderr.Length > 4096)
+            {
+                _recentStderr.Remove(0, _recentStderr.Length - 2048);
+            }
+            _recentStderr.AppendLine(line);
+        }
+    }
+
+    private string GetRecentStderr()
+    {
+        lock (_stderrLock)
+        {
+            return _recentStderr.ToString().Trim();
+        }
+    }
+
     public async Task TerminateAsync()
     {
-        if (_disposed) return;
-        _disposed = true;
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
         _isHealthy = false;
 
         _logger.LogInformation("Terminating AgyWorker {Id} (PID {Pid})", _id, ProcessId);
 
         try
         {
-            if (_stdin != null)
-            {
-                _stdin.Close();
-            }
+            await _workerCts.CancelAsync();
         }
         catch
         {
             // ignored
         }
 
-        if (_process != null)
+        try
+        {
+            _stdin?.Close();
+        }
+        catch
+        {
+            // ignored
+        }
+
+        var proc = Interlocked.Exchange(ref _process, null);
+        if (proc != null)
         {
             try
             {
-                if (!_process.HasExited)
+                if (!proc.HasExited)
                 {
-                    _process.Kill(entireProcessTree: true);
+                    proc.Kill(entireProcessTree: true);
+                    using var reapCts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                    await proc.WaitForExitAsync(reapCts.Token);
                 }
             }
             catch
@@ -387,7 +467,7 @@ public class AgyWorker : IAgyWorker
 
             try
             {
-                _process.Dispose();
+                proc.Dispose();
             }
             catch
             {
@@ -395,8 +475,7 @@ public class AgyWorker : IAgyWorker
             }
         }
 
-        _turnLock.Dispose();
-        await Task.CompletedTask;
+        _workerCts.Dispose();
     }
 
     public async ValueTask DisposeAsync()

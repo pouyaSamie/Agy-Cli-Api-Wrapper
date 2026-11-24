@@ -29,9 +29,13 @@ public interface IAgyWorkerPool : IAsyncDisposable
         string? sessionId,
         string model,
         string effort,
-        CancellationToken cancellationToken = default);
+        string? conversationId = null,
+        CancellationToken cancellationToken = default,
+        bool enableAgentic = false);
 
     void ReleaseWorker(IAgyWorker worker);
+
+    Task WarmUpAsync(CancellationToken cancellationToken = default);
 
     Task RecycleAllAsync(CancellationToken cancellationToken = default);
 

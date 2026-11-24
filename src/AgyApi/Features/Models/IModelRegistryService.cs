@@ -5,6 +5,7 @@ public class ModelResolutionResult
     public required string ActualModel { get; set; }
     public bool EnableAgenticMode { get; set; }
     public bool IsValid { get; set; } = true;
+    public bool IsForbidden { get; set; }
     public string? ErrorMessage { get; set; }
 }
 

@@ -16,6 +16,7 @@ public class AgyExecutionRequest
 {
     public required string Prompt { get; set; }
     public required string Model { get; set; }
+    public string? SessionId { get; set; }
     public string? ConversationId { get; set; }
     public bool EnableAgenticMode { get; set; }
     public string? ReasoningEffort { get; set; }

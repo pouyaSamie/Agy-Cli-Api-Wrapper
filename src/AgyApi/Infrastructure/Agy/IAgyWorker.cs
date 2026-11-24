@@ -1,5 +1,3 @@
-using System.Runtime.CompilerServices;
-
 namespace AgyApi.Infrastructure.Agy;
 
 public interface IAgyWorker : IAsyncDisposable
@@ -9,6 +7,7 @@ public interface IAgyWorker : IAsyncDisposable
     string? CurrentConversationId { get; }
     string Model { get; }
     string Effort { get; }
+    bool EnableAgenticMode { get; }
     int TurnCount { get; }
     DateTime CreatedUtc { get; }
     DateTime LastActiveUtc { get; }

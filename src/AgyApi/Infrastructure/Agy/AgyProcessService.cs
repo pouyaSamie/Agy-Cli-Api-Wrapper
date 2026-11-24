@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Text;
@@ -10,11 +9,12 @@ namespace AgyApi.Infrastructure.Agy;
 
 public class AgyProcessService : IAgyProcessService
 {
+    private const int MaxStderrChars = 8192;
     private readonly AgyOptions _options;
     private readonly IAgyTranscriptReader _transcriptReader;
     private readonly IAgyWorkerPool _workerPool;
     private readonly ILogger<AgyProcessService> _logger;
-    private readonly ConcurrentDictionary<string, SemaphoreSlim> _conversationLocks = new(StringComparer.OrdinalIgnoreCase);
+    private readonly KeyedAsyncLock _conversationLocks = new();
 
     public AgyProcessService(
         IOptions<AgyOptions> options,
@@ -32,14 +32,15 @@ public class AgyProcessService : IAgyProcessService
         AgyExecutionRequest request,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        var conversationLock = string.IsNullOrWhiteSpace(request.ConversationId)
-            ? null
-            : _conversationLocks.GetOrAdd(request.ConversationId, _ => new SemaphoreSlim(1, 1));
+        var lockKey = !string.IsNullOrWhiteSpace(request.SessionId)
+            ? request.SessionId
+            : request.ConversationId;
 
-        if (conversationLock != null)
-        {
-            await conversationLock.WaitAsync(cancellationToken);
-        }
+        using var conversationLease = string.IsNullOrWhiteSpace(lockKey)
+            ? null
+            : await _conversationLocks.AcquireAsync(lockKey, cancellationToken);
+
+        var effectiveAgentic = request.EnableAgenticMode && _options.AllowAgenticTools;
 
         if (_options.EnableWorkerPool)
         {
@@ -48,15 +49,45 @@ public class AgyProcessService : IAgyProcessService
                 : _options.DefaultReasoningEffort;
 
             IAgyWorker? worker = null;
+            string? acquireError = null;
             try
             {
-                worker = await _workerPool.AcquireWorkerAsync(
-                    request.ConversationId,
-                    request.Model,
-                    effort,
-                    cancellationToken);
+                try
+                {
+                    worker = await _workerPool.AcquireWorkerAsync(
+                        request.SessionId,
+                        request.Model,
+                        effort,
+                        request.ConversationId,
+                        cancellationToken,
+                        effectiveAgentic);
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (TimeoutException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Failed to acquire AGY worker for model {Model}", request.Model);
+                    acquireError = ex.Message;
+                }
 
-                await foreach (var item in worker.ExecuteTurnStreamAsync(request.Prompt, cancellationToken))
+                if (acquireError != null)
+                {
+                    yield return new AgyStreamItem
+                    {
+                        ConversationId = request.ConversationId,
+                        IsComplete = true,
+                        Error = acquireError
+                    };
+                    yield break;
+                }
+
+                await foreach (var item in worker!.ExecuteTurnStreamAsync(request.Prompt, cancellationToken))
                 {
                     yield return item;
                 }
@@ -67,109 +98,48 @@ public class AgyProcessService : IAgyProcessService
                 {
                     _workerPool.ReleaseWorker(worker);
                 }
-                conversationLock?.Release();
             }
             yield break;
         }
 
         Process? process = null;
+        Task? writeInputTask = null;
+        Task<string>? readStderrTask = null;
+
         try
         {
-            var workspaceDir = Path.GetFullPath(_options.WorkspaceDirectory);
-            if (!Directory.Exists(workspaceDir))
-            {
-                Directory.CreateDirectory(workspaceDir);
-            }
-
-            var exePath = _options.ExecutablePath;
-            if (string.Equals(exePath, "agy", StringComparison.OrdinalIgnoreCase) || string.Equals(exePath, "agy.exe", StringComparison.OrdinalIgnoreCase))
-            {
-                var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-                var candidate = Path.Combine(localAppData, "agy", "bin", "agy.exe");
-                if (File.Exists(candidate))
-                {
-                    exePath = candidate;
-                }
-            }
-
-            var psi = new ProcessStartInfo
-            {
-                FileName = exePath,
-                UseShellExecute = false,
-                RedirectStandardInput = true,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                StandardInputEncoding = Encoding.UTF8,
-                StandardOutputEncoding = Encoding.UTF8,
-                StandardErrorEncoding = Encoding.UTF8,
-                CreateNoWindow = true,
-                WindowStyle = ProcessWindowStyle.Hidden,
-                WorkingDirectory = workspaceDir
-            };
-
-            // NOTE: Do NOT use --print or pass request.Prompt on the command line!
-            // Windows Win32 CreateProcess limits the command-line string to 32,767 characters.
-            // Complex client contexts (e.g. Hermes Gateway with conversation history and tools) exceed this,
-            // resulting in Win32Exception 206 (The filename or extension is too long).
-            // Passing the prompt via StandardInput has no length limitations.
-            psi.ArgumentList.Add("--output-format");
-            psi.ArgumentList.Add("stream-json");
-            psi.ArgumentList.Add("--model");
-            psi.ArgumentList.Add(request.Model);
-
-            var hasEffortTier = request.Model.EndsWith("-high", StringComparison.OrdinalIgnoreCase) ||
-                                request.Model.EndsWith("-medium", StringComparison.OrdinalIgnoreCase) ||
-                                request.Model.EndsWith("-low", StringComparison.OrdinalIgnoreCase);
-
-            var isClaude = request.Model.Contains("claude", StringComparison.OrdinalIgnoreCase);
-
             var effort = !string.IsNullOrWhiteSpace(request.ReasoningEffort)
                 ? request.ReasoningEffort
                 : _options.DefaultReasoningEffort;
 
-            if (!hasEffortTier && !isClaude && !string.IsNullOrWhiteSpace(effort))
-            {
-                psi.ArgumentList.Add("--effort");
-                psi.ArgumentList.Add(effort.ToLowerInvariant());
-            }
+            var psi = AgyProcessHelpers.BuildCliProcessStartInfo(
+                _options,
+                request.Model,
+                effort,
+                request.ConversationId,
+                effectiveAgentic,
+                streamJsonInput: false);
 
-            if (!string.IsNullOrWhiteSpace(request.ConversationId))
-            {
-                psi.ArgumentList.Add("--conversation");
-                psi.ArgumentList.Add(request.ConversationId);
-            }
-
-            // In headless API server mode, always auto-approve tool execution permissions
-            // to prevent process halts on stdin review prompts, and disable interactive slash commands
-            psi.ArgumentList.Add("--dangerously-skip-permissions");
-            psi.ArgumentList.Add("--disable-slash-commands");
-            psi.ArgumentList.Add("--print-timeout");
-            psi.ArgumentList.Add($"{_options.PrintTimeoutMinutes}m0s");
-
-            _logger.LogInformation("Spawning AGY process for model: {Model}, effort: {Effort}, agentic: {Agentic}, conversation: {ConvId}, promptLength: {PromptLen}",
-                request.Model, effort, request.EnableAgenticMode, request.ConversationId ?? "new", request.Prompt.Length);
+            _logger.LogInformation("Spawning one-shot AGY process for model: {Model}, effort: {Effort}, agentic: {Agentic}, conversation: {ConvId}, promptLength: {PromptLen}",
+                request.Model, effort, effectiveAgentic, request.ConversationId ?? "new", request.Prompt.Length);
 
             process = new Process { StartInfo = psi };
-            var stderrBuilder = new StringBuilder();
-
-            process.ErrorDataReceived += (_, e) =>
-            {
-                if (!string.IsNullOrEmpty(e.Data))
-                {
-                    stderrBuilder.AppendLine(e.Data);
-                }
-            };
-
             process.Start();
-            process.BeginErrorReadLine();
 
-            // Asynchronously stream prompt into StandardInput and close to signal EOF
-            var writeInputTask = Task.Run(async () =>
+            var localProcess = process;
+            readStderrTask = ReadBoundedStderrAsync(localProcess.StandardError, cancellationToken);
+
+            // Stream prompt into StandardInput and close to signal EOF
+            writeInputTask = Task.Run(async () =>
             {
                 try
                 {
-                    await process.StandardInput.WriteAsync(request.Prompt);
-                    await process.StandardInput.FlushAsync();
+                    await localProcess.StandardInput.WriteAsync(request.Prompt.AsMemory(), cancellationToken);
+                    await localProcess.StandardInput.FlushAsync(cancellationToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    // Normal on disconnect
                 }
                 catch (Exception ex)
                 {
@@ -179,14 +149,14 @@ public class AgyProcessService : IAgyProcessService
                 {
                     try
                     {
-                        process.StandardInput.Close();
+                        localProcess.StandardInput.Close();
                     }
                     catch
                     {
                         // ignored
                     }
                 }
-            });
+            }, CancellationToken.None);
 
             string? currentConversationId = request.ConversationId;
             var responseBuilder = new StringBuilder();
@@ -269,7 +239,7 @@ public class AgyProcessService : IAgyProcessService
                             }
 
                             string? transcriptThinking = null;
-                            if (!string.IsNullOrEmpty(currentConversationId))
+                            if (_options.IncludeReasoningContent && !string.IsNullOrEmpty(currentConversationId))
                             {
                                 transcriptThinking = await _transcriptReader.ExtractThinkingAsync(currentConversationId, cancellationToken);
                             }
@@ -280,27 +250,19 @@ public class AgyProcessService : IAgyProcessService
                                 IsComplete = true,
                                 FullResponse = result.Response ?? responseBuilder.ToString(),
                                 Thinking = transcriptThinking,
-                                Usage = lastUsage
+                                Usage = lastUsage,
+                                Error = result.Error
                             };
                         }
                         break;
                 }
             }
 
-            try
-            {
-                await writeInputTask;
-            }
-            catch
-            {
-                // ignored
-            }
-
             await process.WaitForExitAsync(cancellationToken);
+            var err = readStderrTask != null ? await readStderrTask : string.Empty;
 
             if (process.ExitCode != 0)
             {
-                var err = stderrBuilder.ToString().Trim();
                 _logger.LogError("AGY exited with code {Code}: {Err}", process.ExitCode, err);
                 yield return new AgyStreamItem
                 {
@@ -315,7 +277,10 @@ public class AgyProcessService : IAgyProcessService
                 string? transcriptContent = null;
                 if (!string.IsNullOrEmpty(currentConversationId))
                 {
-                    transcriptThinking = await _transcriptReader.ExtractThinkingAsync(currentConversationId, cancellationToken);
+                    if (_options.IncludeReasoningContent)
+                    {
+                        transcriptThinking = await _transcriptReader.ExtractThinkingAsync(currentConversationId, cancellationToken);
+                    }
                     transcriptContent = await _transcriptReader.ExtractLatestResponseAsync(currentConversationId, cancellationToken);
                 }
 
@@ -342,17 +307,53 @@ public class AgyProcessService : IAgyProcessService
                     if (!process.HasExited)
                     {
                         process.Kill(entireProcessTree: true);
+                        using var reapCts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                        await process.WaitForExitAsync(reapCts.Token);
                     }
                 }
                 catch
                 {
                     // ignored
                 }
+
+                if (writeInputTask != null)
+                {
+                    try { await writeInputTask.WaitAsync(TimeSpan.FromSeconds(2)); } catch { }
+                }
+
+                if (readStderrTask != null)
+                {
+                    try { await readStderrTask.WaitAsync(TimeSpan.FromSeconds(2)); } catch { }
+                }
+
                 process.Dispose();
             }
-
-            conversationLock?.Release();
         }
+    }
+
+    private static async Task<string> ReadBoundedStderrAsync(StreamReader stderr, CancellationToken cancellationToken)
+    {
+        var sb = new StringBuilder();
+        try
+        {
+            string? line;
+            while ((line = await stderr.ReadLineAsync(cancellationToken)) != null)
+            {
+                if (sb.Length < MaxStderrChars)
+                {
+                    sb.AppendLine(line);
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // ignored
+        }
+        catch
+        {
+            // ignored
+        }
+        return sb.ToString().Trim();
     }
 
     public async Task<AgyStreamItem> ExecutePromptAsync(
@@ -399,7 +400,7 @@ public class AgyProcessService : IAgyProcessService
             }
         }
 
-        if (string.IsNullOrEmpty(thinking) && !string.IsNullOrEmpty(conversationId))
+        if (_options.IncludeReasoningContent && string.IsNullOrEmpty(thinking) && !string.IsNullOrEmpty(conversationId))
         {
             thinking = await _transcriptReader.ExtractThinkingAsync(conversationId, cancellationToken);
         }
