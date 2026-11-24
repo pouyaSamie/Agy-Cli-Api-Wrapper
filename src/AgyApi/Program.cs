@@ -12,8 +12,18 @@ using MudBlazor.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 
-var port = builder.Configuration.GetValue<int>("Agy:Port", 5200);
-builder.WebHost.UseUrls($"http://0.0.0.0:{port}");
+var configuredUrls = Environment.GetEnvironmentVariable("ASPNETCORE_URLS")
+    ?? builder.Configuration["urls"];
+if (string.IsNullOrWhiteSpace(configuredUrls))
+{
+    var bindAddress = builder.Configuration.GetValue<string>("Agy:BindAddress");
+    if (string.IsNullOrWhiteSpace(bindAddress))
+    {
+        bindAddress = "127.0.0.1";
+    }
+    var port = builder.Configuration.GetValue<int>("Agy:Port", 5200);
+    builder.WebHost.UseUrls($"http://{bindAddress}:{port}");
+}
 
 // 1. Configuration & Options
 builder.Services.Configure<AgyOptions>(builder.Configuration.GetSection(AgyOptions.SectionName));
@@ -24,7 +34,7 @@ builder.Services.AddSingleton<IAgyWorkerPool, AgyWorkerPool>();
 builder.Services.AddSingleton<IAgyProcessService, AgyProcessService>();
 builder.Services.AddHostedService<AgyBackgroundService>();
 
-// 3. Feature Slices (Adhering to S.O.L.I.D - SRP & ISP)
+// 3. Feature Slices
 builder.Services.AddSingleton<ApiKeyManager>();
 builder.Services.AddSingleton<IApiKeyManager>(sp => sp.GetRequiredService<ApiKeyManager>());
 builder.Services.AddSingleton<IApiKeyAuthenticator>(sp => sp.GetRequiredService<ApiKeyManager>());
@@ -32,7 +42,6 @@ builder.Services.AddSingleton<IApiKeyUsageRecorder>(sp => sp.GetRequiredService<
 
 builder.Services.AddSingleton<IModelRegistryService, ModelRegistryService>();
 builder.Services.AddSingleton<ISessionManager, SessionManager>();
-builder.Services.AddSingleton<IThoughtStreamProcessor, ThoughtStreamProcessor>();
 builder.Services.AddSingleton<IChatCompletionHandler, ChatCompletionHandler>();
 
 // 4. Blazor UI & MudBlazor Components
@@ -40,21 +49,33 @@ builder.Services.AddRazorComponents()
     .AddInteractiveServerComponents();
 builder.Services.AddMudServices();
 
-// 5. Permissive CORS for Local Tooling & Integrations
+// 5. Restricted CORS (Loopback + explicit Agy:AllowedCorsOrigins allowlist)
+var allowedCorsOrigins = builder.Configuration.GetSection("Agy:AllowedCorsOrigins").Get<string[]>() ?? [];
+var allowedOriginSet = new HashSet<string>(
+    allowedCorsOrigins.Where(o => !string.IsNullOrWhiteSpace(o)).Select(o => o.Trim().TrimEnd('/')),
+    StringComparer.OrdinalIgnoreCase);
+
 builder.Services.AddCors(options =>
 {
     options.AddDefaultPolicy(policy =>
     {
-        policy.AllowAnyOrigin()
-              .AllowAnyMethod()
-              .AllowAnyHeader();
+        policy.SetIsOriginAllowed(origin =>
+        {
+            if (string.IsNullOrWhiteSpace(origin)) return false;
+            if (Uri.TryCreate(origin, UriKind.Absolute, out var uri) && uri.IsLoopback)
+            {
+                return true;
+            }
+            return allowedOriginSet.Contains(origin.TrimEnd('/'));
+        })
+        .AllowAnyMethod()
+        .AllowAnyHeader();
     });
 });
 
 var app = builder.Build();
 
 app.UseCors();
-app.UseDefaultFiles();
 app.UseStaticFiles();
 app.UseAntiforgery();
 app.UseMiddleware<ApiKeyAuthMiddleware>();
