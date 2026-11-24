@@ -8,4 +8,6 @@ public interface IApiKeyManager : IApiKeyAuthenticator, IApiKeyUsageRecorder
     Task<IReadOnlyList<ApiKeyItem>> GetKeysAsync();
     Task<bool> RevokeKeyAsync(string id);
     Task<bool> ResetUsageAsync(string id);
+    Task FlushPendingUpdatesAsync(CancellationToken cancellationToken = default);
+    Task<bool> IsHealthyAsync(CancellationToken cancellationToken = default);
 }
