@@ -11,4 +11,8 @@
     <PackageReference Include="MudBlazor" Version="9.9.0" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="AgyApi.Tests" />
+  </ItemGroup>
+
 </Project>

@@ -28,6 +28,59 @@ public class ThoughtStreamProcessorTests
     }
 
     [Fact]
+    public void Process_WithDefaultEmitTagsFalse_StripsTagsFromContent()
+    {
+        var processor = new ThoughtStreamProcessor(emitTagsInContent: false);
+
+        var c1 = processor.Process("<think>internal thoughts</think>Final answer");
+        var flushed = processor.Flush();
+
+        Assert.Equal("internal thoughts", c1.ReasoningDelta);
+        Assert.Equal("Final answer", c1.ContentDelta);
+        Assert.Null(flushed.ContentDelta);
+        Assert.Equal("internal thoughts", processor.GetFullThinking());
+        Assert.Equal("Final answer", processor.GetFullContent());
+    }
+
+    [Fact]
+    public void Process_SingleCharAngleBracketChunks_BuffersPartialTagsCorrectly()
+    {
+        var processor = new ThoughtStreamProcessor(emitTagsInContent: false);
+
+        var chunks = new[] { "<", "think", ">", "step 1", "<", "/", "think", ">", "Result!" };
+        var content = "";
+        var reasoning = "";
+
+        foreach (var ch in chunks)
+        {
+            var res = processor.Process(ch);
+            if (res.ContentDelta != null) content += res.ContentDelta;
+            if (res.ReasoningDelta != null) reasoning += res.ReasoningDelta;
+        }
+        var flushed = processor.Flush();
+        if (flushed.ContentDelta != null) content += flushed.ContentDelta;
+        if (flushed.ReasoningDelta != null) reasoning += flushed.ReasoningDelta;
+
+        Assert.Equal("step 1", reasoning);
+        Assert.Equal("Result!", content);
+        Assert.Equal("step 1", processor.GetFullThinking());
+        Assert.Equal("Result!", processor.GetFullContent());
+    }
+
+    [Fact]
+    public void Process_TrailingPartialAngleBracket_FlushesOnFlush()
+    {
+        var processor = new ThoughtStreamProcessor(emitTagsInContent: false);
+
+        var c1 = processor.Process("a <");
+        Assert.Equal("a ", c1.ContentDelta);
+
+        var flushed = processor.Flush();
+        Assert.Equal("<", flushed.ContentDelta);
+        Assert.Equal("a <", processor.GetFullContent());
+    }
+
+    [Fact]
     public void Process_WithoutThinkTags_StreamsContentDirectly()
     {
         var processor = new ThoughtStreamProcessor(emitTagsInContent: true);
