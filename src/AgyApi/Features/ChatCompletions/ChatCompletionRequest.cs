@@ -6,7 +6,7 @@ namespace AgyApi.Features.ChatCompletions;
 public class ChatCompletionRequest
 {
     [JsonPropertyName("model")]
-    public string Model { get; set; } = "gemini-3.8-flash-high";
+    public string Model { get; set; } = "gemini-3.8-flash-medium";
 
     [JsonPropertyName("messages")]
     public List<ChatMessage> Messages { get; set; } = [];
@@ -45,7 +45,7 @@ public class ChatCompletionRequest
 public class StreamOptions
 {
     [JsonPropertyName("include_usage")]
-    public bool IncludeUsage { get; set; } = true;
+    public bool IncludeUsage { get; set; } = false;
 }
 
 public class ChatMessage
@@ -78,8 +78,15 @@ public class ChatMessage
 
 public class MessageContentConverter : JsonConverter<string>
 {
+    public override bool HandleNull => true;
+
     public override string Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
     {
+        if (reader.TokenType == JsonTokenType.Null)
+        {
+            return string.Empty;
+        }
+
         if (reader.TokenType == JsonTokenType.String)
         {
             return reader.GetString() ?? string.Empty;
@@ -96,7 +103,8 @@ public class MessageContentConverter : JsonConverter<string>
                     parts.Add(element.GetString() ?? string.Empty);
                 }
                 else if (element.ValueKind == JsonValueKind.Object &&
-                         element.TryGetProperty("text", out var textProp))
+                         element.TryGetProperty("text", out var textProp) &&
+                         textProp.ValueKind == JsonValueKind.String)
                 {
                     parts.Add(textProp.GetString() ?? string.Empty);
                 }
@@ -110,6 +118,6 @@ public class MessageContentConverter : JsonConverter<string>
 
     public override void Write(Utf8JsonWriter writer, string value, JsonSerializerOptions options)
     {
-        writer.WriteStringValue(value);
+        writer.WriteStringValue(value ?? string.Empty);
     }
 }

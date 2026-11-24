@@ -25,12 +25,6 @@ public class SessionManager : ISessionManager
             return info.ConversationId;
         }
 
-        // If sessionKey looks like a valid GUID itself, allow direct use
-        if (Guid.TryParse(sessionKey, out _))
-        {
-            return sessionKey;
-        }
-
         return null;
     }
 
@@ -85,11 +79,7 @@ public class SessionManager : ISessionManager
                 foreach (var tm in trailingToolMsgs)
                 {
                     var toolName = tm.Name ?? tm.ToolCallId ?? "tool";
-                    var contentStr = tm.Content?.Trim() ?? string.Empty;
-                    var contentJson = ((contentStr.StartsWith('{') && contentStr.EndsWith('}')) || (contentStr.StartsWith('[') && contentStr.EndsWith(']')))
-                        ? contentStr
-                        : JsonSerializer.Serialize(contentStr);
-                    sbTools.AppendLine($"Tool Output: <tool_response>\n{{\"name\": \"{toolName}\", \"content\": {contentJson}}}\n</tool_response>");
+                    sbTools.AppendLine(FormatToolResponse(toolName, tm.Content));
                 }
 
                 sbTools.AppendLine("\n(Instruction: Synthesize the tool output and provide your complete response.)");
@@ -97,14 +87,14 @@ public class SessionManager : ISessionManager
             }
 
             var lastUserMsg = request.Messages.LastOrDefault(m => m.Role.Equals("user", StringComparison.OrdinalIgnoreCase));
-            var userText = lastUserMsg?.Content ?? request.Messages[^1].Content;
+            var userText = lastUserMsg?.Content ?? request.Messages[^1].Content ?? string.Empty;
 
             var directives = new List<string>();
-            if (!hasTools && !enableAgentic && !userText.Contains("DO NOT call or execute tools"))
+            if (!hasTools && !enableAgentic && !userText.Contains("DO NOT call or execute tools", StringComparison.Ordinal))
             {
                 directives.Add("Output your complete final answer directly as text without calling tools or terminal commands.");
             }
-            if (!string.IsNullOrEmpty(thinkingDirective) && !userText.Contains("<think>"))
+            if (!string.IsNullOrEmpty(thinkingDirective) && !userText.Contains("<think>", StringComparison.OrdinalIgnoreCase))
             {
                 directives.Add(thinkingDirective);
             }
@@ -120,16 +110,24 @@ public class SessionManager : ISessionManager
         // For new sessions:
         if (request.Messages.Count == 1 && string.IsNullOrEmpty(thinkingDirective) && enableAgentic && !hasTools)
         {
-            return request.Messages[0].Content;
+            return request.Messages[0].Content ?? string.Empty;
         }
 
         var sb = new StringBuilder();
-        var systemMsg = request.Messages.FirstOrDefault(m => m.Role.Equals("system", StringComparison.OrdinalIgnoreCase));
-
         var combinedSystemInstructions = new StringBuilder();
-        if (systemMsg != null && !string.IsNullOrWhiteSpace(systemMsg.Content))
+
+        foreach (var sysMsg in request.Messages.Where(m =>
+                     m.Role.Equals("system", StringComparison.OrdinalIgnoreCase) ||
+                     m.Role.Equals("developer", StringComparison.OrdinalIgnoreCase)))
         {
-            combinedSystemInstructions.Append(systemMsg.Content.Trim());
+            if (!string.IsNullOrWhiteSpace(sysMsg.Content))
+            {
+                if (combinedSystemInstructions.Length > 0)
+                {
+                    combinedSystemInstructions.Append("\n\n");
+                }
+                combinedSystemInstructions.Append(sysMsg.Content.Trim());
+            }
         }
 
         if (!string.IsNullOrEmpty(thinkingDirective))
@@ -156,8 +154,7 @@ public class SessionManager : ISessionManager
                     toolsList.Add(element);
                 }
             }
-            var options = new JsonSerializerOptions { WriteIndented = false };
-            var toolsJson = JsonSerializer.Serialize(toolsList, options);
+            var toolsJson = JsonSerializer.Serialize(toolsList);
 
             toolsSpecification = $@"# Available Tools
 The external client provides the following functions:
@@ -217,21 +214,25 @@ Important rules for tool calling:
             sb.AppendLine();
         }
 
-        var nonSystemMessages = request.Messages.Where(m => !m.Role.Equals("system", StringComparison.OrdinalIgnoreCase)).ToList();
+        var nonSystemMessages = request.Messages
+            .Where(m => !m.Role.Equals("system", StringComparison.OrdinalIgnoreCase) &&
+                        !m.Role.Equals("developer", StringComparison.OrdinalIgnoreCase))
+            .ToList();
 
         if (nonSystemMessages.Count == 1 &&
             nonSystemMessages[0].Role.Equals("user", StringComparison.OrdinalIgnoreCase) &&
             combinedSystemInstructions.Length == 0)
         {
-            sb.Append(nonSystemMessages[0].Content);
+            sb.Append(nonSystemMessages[0].Content ?? string.Empty);
             return sb.ToString();
         }
 
         foreach (var msg in nonSystemMessages)
         {
-            // Skip empty assistant turns (which happen when prior requests produced empty responses)
+            var msgContent = msg.Content ?? string.Empty;
+
             if (msg.Role.Equals("assistant", StringComparison.OrdinalIgnoreCase) &&
-                (string.IsNullOrWhiteSpace(msg.Content) || msg.Content.Trim().Equals("(empty)", StringComparison.OrdinalIgnoreCase)) &&
+                (string.IsNullOrWhiteSpace(msgContent) || msgContent.Trim().Equals("(empty)", StringComparison.OrdinalIgnoreCase)) &&
                 string.IsNullOrWhiteSpace(msg.ReasoningContent) &&
                 (!msg.ToolCalls.HasValue || msg.ToolCalls.Value.ValueKind != JsonValueKind.Array || msg.ToolCalls.Value.GetArrayLength() == 0))
             {
@@ -241,11 +242,7 @@ Important rules for tool calling:
             if (msg.Role.Equals("tool", StringComparison.OrdinalIgnoreCase) || msg.Role.Equals("function", StringComparison.OrdinalIgnoreCase))
             {
                 var toolName = msg.Name ?? msg.ToolCallId ?? "tool";
-                var contentStr = msg.Content?.Trim() ?? string.Empty;
-                var contentJson = ((contentStr.StartsWith('{') && contentStr.EndsWith('}')) || (contentStr.StartsWith('[') && contentStr.EndsWith(']')))
-                    ? contentStr
-                    : JsonSerializer.Serialize(contentStr);
-                sb.AppendLine($"Tool Output: <tool_response>\n{{\"name\": \"{toolName}\", \"content\": {contentJson}}}\n</tool_response>");
+                sb.AppendLine(FormatToolResponse(toolName, msgContent));
                 continue;
             }
 
@@ -282,26 +279,23 @@ Important rules for tool calling:
 
                     if (!string.IsNullOrEmpty(name))
                     {
-                        args = string.IsNullOrWhiteSpace(args) ? "{}" : args;
-                        toolCallsSb.AppendLine($"<tool_call>\n{{\"name\": \"{name}\", \"arguments\": {args}}}\n</tool_call>");
+                        toolCallsSb.AppendLine(FormatToolCall(name, args));
                     }
                 }
             }
 
             var toolCallsText = toolCallsSb.Length > 0 ? "\n" + toolCallsSb.ToString().TrimEnd() : string.Empty;
 
-            // If assistant message had previous reasoning_content (e.g. from Hermes Agent echo), preserve it
             if (!string.IsNullOrEmpty(msg.ReasoningContent))
             {
-                var contentText = !string.IsNullOrEmpty(msg.Content) ? "\n" + msg.Content : string.Empty;
+                var contentText = !string.IsNullOrEmpty(msgContent) ? "\n" + msgContent : string.Empty;
                 sb.AppendLine($"{roleLabel}: <think>\n{msg.ReasoningContent}\n</think>{contentText}{toolCallsText}");
             }
             else
             {
-                var contentPart = !string.IsNullOrEmpty(msg.Content) ? msg.Content : string.Empty;
-                if (!string.IsNullOrEmpty(contentPart) && !string.IsNullOrEmpty(toolCallsText))
+                if (!string.IsNullOrEmpty(msgContent) && !string.IsNullOrEmpty(toolCallsText))
                 {
-                    sb.AppendLine($"{roleLabel}: {contentPart}{toolCallsText}");
+                    sb.AppendLine($"{roleLabel}: {msgContent}{toolCallsText}");
                 }
                 else if (!string.IsNullOrEmpty(toolCallsText))
                 {
@@ -309,12 +303,59 @@ Important rules for tool calling:
                 }
                 else
                 {
-                    sb.AppendLine($"{roleLabel}: {contentPart}");
+                    sb.AppendLine($"{roleLabel}: {msgContent}");
                 }
             }
         }
 
         return sb.ToString();
+    }
+
+    private static string FormatToolResponse(string toolName, string? rawContent)
+    {
+        var contentStr = rawContent?.Trim() ?? string.Empty;
+        object contentObj = contentStr;
+
+        if ((contentStr.StartsWith('{') && contentStr.EndsWith('}')) ||
+            (contentStr.StartsWith('[') && contentStr.EndsWith(']')))
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(contentStr);
+                contentObj = doc.RootElement.Clone();
+            }
+            catch (JsonException)
+            {
+                // Keep as string when content is not valid JSON
+            }
+        }
+
+        var payload = JsonSerializer.Serialize(new { name = toolName, content = contentObj });
+        return $"Tool Output: <tool_response>\n{payload}\n</tool_response>";
+    }
+
+    private static string FormatToolCall(string name, string? rawArgs)
+    {
+        object argsObj;
+        if (string.IsNullOrWhiteSpace(rawArgs))
+        {
+            argsObj = new Dictionary<string, object>();
+        }
+        else
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(rawArgs);
+                argsObj = doc.RootElement.Clone();
+            }
+            catch (JsonException)
+            {
+                argsObj = rawArgs;
+            }
+        }
+
+        var payload = JsonSerializer.Serialize(new { name, arguments = argsObj });
+        return $"<tool_call>\n{payload}\n</tool_call>";
     }
 
     public int CleanupExpiredSessions(TimeSpan expiration)

@@ -1,4 +1,3 @@
-using System.Text;
 using System.Text.Json;
 using AgyApi.Configuration;
 using AgyApi.Features.ApiKeys;
@@ -39,61 +38,75 @@ public class ChatCompletionHandler : IChatCompletionHandler
 
     public async Task<IResult> HandleAsync(HttpContext context, ChatCompletionRequest request, CancellationToken cancellationToken)
     {
-        string? sessionKey = null;
+        // Only stick sessions on explicit client session headers or OpenAI 'user', scoped per authenticated API key
+        string? rawSessionKey = null;
         if (context.Request.Headers.TryGetValue("X-Conversation-Id", out var convIdHeader) &&
             !string.IsNullOrWhiteSpace(convIdHeader))
         {
-            sessionKey = convIdHeader.ToString().Trim();
+            rawSessionKey = convIdHeader.ToString().Trim();
         }
         else if (context.Request.Headers.TryGetValue("X-Session-Id", out var sessIdHeader) &&
                  !string.IsNullOrWhiteSpace(sessIdHeader))
         {
-            sessionKey = sessIdHeader.ToString().Trim();
+            rawSessionKey = sessIdHeader.ToString().Trim();
         }
         else if (!string.IsNullOrWhiteSpace(request.User))
         {
-            sessionKey = request.User.Trim();
+            rawSessionKey = request.User.Trim();
         }
-        else if (request.Messages != null && request.Messages.Count > 0)
-        {
-            var firstUserMsg = request.Messages.FirstOrDefault(m => m.Role.Equals("user", StringComparison.OrdinalIgnoreCase));
-            if (firstUserMsg != null && !string.IsNullOrWhiteSpace(firstUserMsg.Content))
-            {
-                using var sha = System.Security.Cryptography.SHA256.Create();
-                var bytes = sha.ComputeHash(Encoding.UTF8.GetBytes(firstUserMsg.Content.Trim()));
-                sessionKey = "sess-" + Convert.ToHexString(bytes)[..16].ToLowerInvariant();
-            }
-        }
+
+        var callerScope = context.Items.TryGetValue("AuthApiKeyId", out var kIdScope) && kIdScope is string scopeId && !string.IsNullOrWhiteSpace(scopeId)
+            ? scopeId
+            : "local";
+
+        var sessionKey = !string.IsNullOrWhiteSpace(rawSessionKey)
+            ? $"{callerScope}:{rawSessionKey}"
+            : null;
 
         var existingConvId = sessionKey != null ? _sessionManager.GetConversationId(sessionKey) : null;
         var isContinuing = !string.IsNullOrWhiteSpace(existingConvId);
 
-        // Resolve model & agentic execution mode
+        // Resolve model & enforce agentic execution policy
         var modelResolution = _modelRegistry.ResolveModel(request.Model, request.ReasoningEffort);
         if (!modelResolution.IsValid)
         {
-            return Results.NotFound(new
+            if (modelResolution.IsForbidden)
             {
-                error = new
-                {
-                    message = modelResolution.ErrorMessage ?? "Model not found",
-                    type = "invalid_request_error",
-                    param = "model",
-                    code = "model_not_found"
-                }
-            });
+                return CreateErrorResult(
+                    StatusCodes.Status403Forbidden,
+                    modelResolution.ErrorMessage ?? "Agentic mode is disabled on this server.",
+                    "permission_error",
+                    "model",
+                    "agentic_mode_disabled");
+            }
+
+            return CreateErrorResult(
+                StatusCodes.Status404NotFound,
+                modelResolution.ErrorMessage ?? "Model not found",
+                "invalid_request_error",
+                "model",
+                "model_not_found");
         }
 
         var enableAgentic = modelResolution.EnableAgenticMode;
         if (context.Request.Headers.TryGetValue("X-Agy-Mode", out var agyModeHeader) &&
             string.Equals(agyModeHeader.ToString().Trim(), "agent", StringComparison.OrdinalIgnoreCase))
         {
+            if (!_options.AllowAgenticTools)
+            {
+                return CreateErrorResult(
+                    StatusCodes.Status403Forbidden,
+                    "Agentic tool execution is disabled by server policy (Agy:AllowAgenticTools=false).",
+                    "permission_error",
+                    "X-Agy-Mode",
+                    "agentic_mode_disabled");
+            }
             enableAgentic = true;
         }
 
-        // Determine if thinking mode should be activated
         var isThinkingModel = modelResolution.ActualModel.Contains("thinking", StringComparison.OrdinalIgnoreCase) ||
                               modelResolution.ActualModel.Contains("-high", StringComparison.OrdinalIgnoreCase) ||
+                              modelResolution.ActualModel.Contains("-xhigh", StringComparison.OrdinalIgnoreCase) ||
                               modelResolution.ActualModel.Contains("gpt-oss", StringComparison.OrdinalIgnoreCase) ||
                               modelResolution.ActualModel.Contains("claude", StringComparison.OrdinalIgnoreCase);
 
@@ -103,39 +116,54 @@ public class ChatCompletionHandler : IChatCompletionHandler
         var prompt = _sessionManager.PreparePrompt(request, isContinuing, enableThinking, enableAgentic);
         if (string.IsNullOrWhiteSpace(prompt))
         {
-            return Results.BadRequest(new
-            {
-                error = new
-                {
-                    message = "Messages array cannot be empty.",
-                    type = "invalid_request_error",
-                    code = "empty_messages"
-                }
-            });
+            return CreateErrorResult(
+                StatusCodes.Status400BadRequest,
+                "Messages array cannot be empty.",
+                "invalid_request_error",
+                "messages",
+                "empty_messages");
         }
 
         var executionRequest = new AgyExecutionRequest
         {
             Prompt = prompt,
             Model = modelResolution.ActualModel,
-            ConversationId = existingConvId ?? sessionKey,
+            SessionId = sessionKey,
+            ConversationId = existingConvId,
             EnableAgenticMode = enableAgentic,
             ReasoningEffort = request.ReasoningEffort ?? _options.DefaultReasoningEffort
         };
 
         var createdTimestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        var completionId = "chatcmpl-" + (existingConvId ?? Guid.NewGuid().ToString("N"));
+        var completionId = "chatcmpl-" + Guid.NewGuid().ToString("N");
 
-        // Only emit tags in content if explicitly configured as "content" (standard OpenAI/LM Studio clients want clean content and reasoning in fields)
-        var emitTagsInContent = string.Equals(_options.ReasoningFormat, "content", StringComparison.OrdinalIgnoreCase);
+        var reasoningFormat = (_options.ReasoningFormat ?? "field").Trim().ToLowerInvariant();
+        var emitTagsInContent = reasoningFormat is "tags" or "content" or "both";
+        var emitReasoningFields = reasoningFormat is "field" or "both" || !emitTagsInContent;
 
-        if (request.Stream)
+        try
         {
-            return await HandleStreamAsync(context, executionRequest, request, sessionKey, completionId, createdTimestamp, emitTagsInContent, prompt, cancellationToken);
+            if (request.Stream)
+            {
+                return await HandleStreamAsync(context, executionRequest, request, sessionKey, completionId, createdTimestamp, emitTagsInContent, emitReasoningFields, prompt, cancellationToken);
+            }
+
+            return await HandleNonStreamAsync(context, executionRequest, request, sessionKey, completionId, createdTimestamp, emitTagsInContent, emitReasoningFields, prompt, cancellationToken);
         }
-        else
+        catch (TimeoutException ex)
         {
-            return await HandleNonStreamAsync(context, executionRequest, request, sessionKey, completionId, createdTimestamp, emitTagsInContent, prompt, cancellationToken);
+            _logger.LogWarning(ex, "Worker pool saturated while handling chat completion");
+            if (!context.Response.HasStarted)
+            {
+                context.Response.Headers.RetryAfter = "5";
+                return CreateErrorResult(
+                    StatusCodes.Status503ServiceUnavailable,
+                    "All inference workers are currently busy. Please retry shortly.",
+                    "server_error",
+                    null,
+                    "worker_pool_saturated");
+            }
+            return Results.Empty;
         }
     }
 
@@ -147,6 +175,7 @@ public class ChatCompletionHandler : IChatCompletionHandler
         string completionId,
         long createdTimestamp,
         bool emitTagsInContent,
+        bool emitReasoningFields,
         string prompt,
         CancellationToken cancellationToken)
     {
@@ -154,17 +183,16 @@ public class ChatCompletionHandler : IChatCompletionHandler
         context.Response.Headers.CacheControl = "no-cache";
         context.Response.Headers.Connection = "keep-alive";
 
-        var responseStream = context.Response.Body;
-        var writer = new StreamWriter(responseStream, leaveOpen: true);
-        var writeLock = new SemaphoreSlim(1, 1);
+        await using var writer = new StreamWriter(context.Response.Body, leaveOpen: true);
+        using var writeLock = new SemaphoreSlim(1, 1);
 
-        async Task WriteRawChunkAsync(string payload)
+        async Task WriteRawAsync(string payload, CancellationToken ct)
         {
-            await writeLock.WaitAsync(cancellationToken);
+            await writeLock.WaitAsync(ct);
             try
             {
                 await writer.WriteAsync(payload);
-                await writer.FlushAsync(cancellationToken);
+                await writer.FlushAsync(ct);
             }
             finally
             {
@@ -172,34 +200,40 @@ public class ChatCompletionHandler : IChatCompletionHandler
             }
         }
 
+        Task WriteChunkAsync(ChunkDelta delta, string? finishReason = null, UsageStatistics? usage = null, bool emptyChoices = false)
+        {
+            var chunk = new ChatCompletionChunk
+            {
+                Id = completionId,
+                Created = createdTimestamp,
+                Model = request.Model,
+                Choices = emptyChoices
+                    ? []
+                    : [new ChunkChoice { Index = 0, Delta = delta, FinishReason = finishReason }],
+                Usage = usage
+            };
+            return WriteRawAsync($"data: {JsonSerializer.Serialize(chunk)}\n\n", cancellationToken);
+        }
+
+        ChunkDelta CreateReasoningDelta(string text) => new()
+        {
+            ReasoningContent = text,
+            Reasoning = _options.EmitLegacyReasoningField ? text : null
+        };
+
         string? recordedConvId = executionRequest.ConversationId;
-        bool hasSentRole = false;
         bool hasStreamedReasoning = false;
+        bool hadStreamError = false;
         AgyUsage? finalUsage = null;
         string? finalFullResponse = null;
         string? finalThinking = null;
         var streamProcessor = new ThoughtStreamProcessor(emitTagsInContent);
         var toolCallProcessor = new ToolCallStreamProcessor();
 
-        // 1. Immediately emit role: assistant chunk so client receives immediate TTFT and active stream indication
-        var initialRoleChunk = new ChatCompletionChunk
-        {
-            Id = completionId,
-            Created = createdTimestamp,
-            Model = request.Model,
-            Choices =
-            [
-                new ChunkChoice
-                {
-                    Index = 0,
-                    Delta = new ChunkDelta { Role = "assistant" }
-                }
-            ]
-        };
-        await WriteRawChunkAsync($"data: {JsonSerializer.Serialize(initialRoleChunk)}\n\n");
-        hasSentRole = true;
+        // Emit initial role chunk with immutable completionId
+        await WriteChunkAsync(new ChunkDelta { Role = "assistant" });
 
-        // 2. Start background keep-alive ping loop to prevent client watchdogs (e.g. Hermes 60s idle timeout)
+        // Comment-only SSE heartbeat prevents proxy/client idle timeouts without injecting fake JSON deltas
         var keepAliveSeconds = _options.StreamKeepAliveSeconds > 0 ? _options.StreamKeepAliveSeconds : 15;
         using var keepAliveCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var keepAliveTask = Task.Run(async () =>
@@ -209,32 +243,18 @@ public class ChatCompletionHandler : IChatCompletionHandler
                 using var timer = new PeriodicTimer(TimeSpan.FromSeconds(keepAliveSeconds));
                 while (await timer.WaitForNextTickAsync(keepAliveCts.Token))
                 {
-                    var pingChunk = new ChatCompletionChunk
-                    {
-                        Id = completionId,
-                        Created = createdTimestamp,
-                        Model = request.Model,
-                        Choices =
-                        [
-                            new ChunkChoice
-                            {
-                                Index = 0,
-                                Delta = new ChunkDelta()
-                            }
-                        ]
-                    };
-                    await WriteRawChunkAsync($": keep-alive\n\ndata: {JsonSerializer.Serialize(pingChunk)}\n\n");
+                    await WriteRawAsync(": keep-alive\n\n", keepAliveCts.Token);
                 }
             }
             catch (OperationCanceledException)
             {
-                // Normal termination when stream concludes
+                // Normal termination
             }
             catch (Exception ex)
             {
                 _logger.LogDebug(ex, "Keep-alive ping loop ended");
             }
-        }, cancellationToken);
+        }, CancellationToken.None);
 
         try
         {
@@ -243,489 +263,202 @@ public class ChatCompletionHandler : IChatCompletionHandler
                 if (!string.IsNullOrEmpty(item.ConversationId))
                 {
                     recordedConvId = item.ConversationId;
-                    completionId = "chatcmpl-" + recordedConvId;
                     if (!string.IsNullOrEmpty(sessionKey))
                     {
                         _sessionManager.SetConversationId(sessionKey, recordedConvId);
                     }
                 }
 
-                if (item.Usage != null)
-                {
-                    finalUsage = item.Usage;
-                }
+                if (item.Usage != null) finalUsage = item.Usage;
+                if (!string.IsNullOrEmpty(item.FullResponse)) finalFullResponse = item.FullResponse;
+                if (!string.IsNullOrEmpty(item.Thinking)) finalThinking = item.Thinking;
 
-                if (!string.IsNullOrEmpty(item.FullResponse))
+                if (!string.IsNullOrEmpty(item.Error))
                 {
-                    finalFullResponse = item.FullResponse;
-                }
-
-                if (!string.IsNullOrEmpty(item.Thinking))
-                {
-                    finalThinking = item.Thinking;
-                }
-
-                if (!hasSentRole)
-                {
-                    var roleChunk = new ChatCompletionChunk
+                    hadStreamError = true;
+                    _logger.LogError("Streaming error from AGY: {Error}", item.Error);
+                    var errPayload = JsonSerializer.Serialize(new
                     {
-                        Id = completionId,
-                        Created = createdTimestamp,
-                        Model = request.Model,
-                        Choices =
-                        [
-                            new ChunkChoice
-                            {
-                                Index = 0,
-                                Delta = new ChunkDelta { Role = "assistant" }
-                            }
-                        ]
-                    };
-
-                    await WriteRawChunkAsync($"data: {JsonSerializer.Serialize(roleChunk)}\n\n");
-                    hasSentRole = true;
+                        error = new
+                        {
+                            message = item.Error,
+                            type = "server_error",
+                            code = "agy_error"
+                        }
+                    });
+                    await WriteRawAsync($"event: error\ndata: {errPayload}\n\n", cancellationToken);
+                    break;
                 }
 
-                // If item has explicit ReasoningDelta (from live stream)
-                if (!string.IsNullOrEmpty(item.ReasoningDelta))
+                if (!string.IsNullOrEmpty(item.TextDelta))
+                {
+                    var processed = streamProcessor.Process(item.TextDelta);
+
+                    if (!string.IsNullOrEmpty(processed.ReasoningDelta))
+                    {
+                        hasStreamedReasoning = true;
+                        if (emitReasoningFields)
+                        {
+                            await WriteChunkAsync(CreateReasoningDelta(processed.ReasoningDelta));
+                        }
+                    }
+
+                    if (!string.IsNullOrEmpty(processed.ContentDelta))
+                    {
+                        if (_options.IncludeReasoningContent &&
+                            !hasStreamedReasoning &&
+                            !streamProcessor.HasSeenThinking &&
+                            !string.IsNullOrEmpty(recordedConvId))
+                        {
+                            var transcriptThinking = await _transcriptReader.ExtractThinkingAsync(recordedConvId, cancellationToken);
+                            if (!string.IsNullOrEmpty(transcriptThinking))
+                            {
+                                hasStreamedReasoning = true;
+                                finalThinking = transcriptThinking;
+                                await EmitThinkingImmediateAsync(WriteChunkAsync, CreateReasoningDelta, transcriptThinking, emitReasoningFields, emitTagsInContent);
+                            }
+                        }
+
+                        var toolProcessed = toolCallProcessor.Process(processed.ContentDelta);
+                        if (!string.IsNullOrEmpty(toolProcessed.ContentDelta))
+                        {
+                            await WriteChunkAsync(new ChunkDelta { Content = toolProcessed.ContentDelta });
+                        }
+                        if (toolProcessed.NewToolCalls is { Count: > 0 })
+                        {
+                            await WriteChunkAsync(new ChunkDelta { ToolCalls = toolProcessed.NewToolCalls });
+                        }
+                    }
+                }
+            }
+
+            if (!hadStreamError)
+            {
+                var flushed = streamProcessor.Flush();
+                if (!string.IsNullOrEmpty(flushed.ReasoningDelta))
                 {
                     hasStreamedReasoning = true;
-                    var reasoningChunk = new ChatCompletionChunk
+                    if (emitReasoningFields)
                     {
-                        Id = completionId,
-                        Created = createdTimestamp,
-                        Model = request.Model,
-                        Choices =
-                        [
-                            new ChunkChoice
-                            {
-                                Index = 0,
-                                Delta = new ChunkDelta
-                                {
-                                    ReasoningContent = item.ReasoningDelta,
-                                    Reasoning = item.ReasoningDelta
-                                }
-                            }
-                        ]
-                    };
-                    await WriteRawChunkAsync($"data: {JsonSerializer.Serialize(reasoningChunk)}\n\n");
+                        await WriteChunkAsync(CreateReasoningDelta(flushed.ReasoningDelta));
+                    }
+                }
+                if (!string.IsNullOrEmpty(flushed.ContentDelta))
+                {
+                    var toolProcessedFlushed = toolCallProcessor.Process(flushed.ContentDelta);
+                    if (!string.IsNullOrEmpty(toolProcessedFlushed.ContentDelta))
+                    {
+                        await WriteChunkAsync(new ChunkDelta { Content = toolProcessedFlushed.ContentDelta });
+                    }
+                    if (toolProcessedFlushed.NewToolCalls is { Count: > 0 })
+                    {
+                        await WriteChunkAsync(new ChunkDelta { ToolCalls = toolProcessedFlushed.NewToolCalls });
+                    }
                 }
 
-            if (!string.IsNullOrEmpty(item.TextDelta))
-            {
-                var processed = streamProcessor.Process(item.TextDelta);
+                var toolFlushed = toolCallProcessor.Flush();
+                if (!string.IsNullOrEmpty(toolFlushed.ContentDelta))
+                {
+                    await WriteChunkAsync(new ChunkDelta { Content = toolFlushed.ContentDelta });
+                }
+                if (toolFlushed.NewToolCalls is { Count: > 0 })
+                {
+                    await WriteChunkAsync(new ChunkDelta { ToolCalls = toolFlushed.NewToolCalls });
+                }
 
-                // If reasoning was detected in this chunk (<think> tag stream), emit reasoning_content delta
-                if (!string.IsNullOrEmpty(processed.ReasoningDelta))
+                var fullContent = toolCallProcessor.GetFullContent();
+                var fullThinking = streamProcessor.GetFullThinking();
+                bool hasToolCalls = toolCallProcessor.HasToolCalls;
+
+                if (_options.IncludeReasoningContent && !hasStreamedReasoning && string.IsNullOrEmpty(fullThinking) && !string.IsNullOrEmpty(finalThinking))
                 {
                     hasStreamedReasoning = true;
-                    var reasoningChunk = new ChatCompletionChunk
-                    {
-                        Id = completionId,
-                        Created = createdTimestamp,
-                        Model = request.Model,
-                        Choices =
-                        [
-                            new ChunkChoice
-                            {
-                                Index = 0,
-                                Delta = new ChunkDelta
-                                {
-                                    ReasoningContent = processed.ReasoningDelta,
-                                    Reasoning = processed.ReasoningDelta
-                                }
-                            }
-                        ]
-                    };
-
-                    await WriteRawChunkAsync($"data: {JsonSerializer.Serialize(reasoningChunk)}\n\n");
+                    await EmitThinkingImmediateAsync(WriteChunkAsync, CreateReasoningDelta, finalThinking, emitReasoningFields, emitTagsInContent);
+                    fullThinking = finalThinking;
                 }
 
-                // If content is ready to be emitted (answer text or tool calls)
-                if (!string.IsNullOrEmpty(processed.ContentDelta))
+                // Fallback to result.FullResponse if delta chunks were omitted
+                if (string.IsNullOrEmpty(fullContent) && !hasToolCalls && !string.IsNullOrEmpty(finalFullResponse))
                 {
-                    // If no reasoning has been streamed yet (model used native thinking without <think> tags in text),
-                    // extract native thinking from transcript file BEFORE emitting the first content chunk!
-                    if (!hasStreamedReasoning && !streamProcessor.HasSeenThinking && !string.IsNullOrEmpty(recordedConvId))
+                    var extraTools = ToolCallStreamProcessor.ExtractToolCalls(finalFullResponse);
+                    if (extraTools.Count > 0)
                     {
-                        var transcriptThinking = await _transcriptReader.ExtractThinkingAsync(recordedConvId, cancellationToken);
-                        if (string.IsNullOrEmpty(transcriptThinking))
-                        {
-                            await Task.Delay(50, cancellationToken);
-                            transcriptThinking = await _transcriptReader.ExtractThinkingAsync(recordedConvId, cancellationToken);
-                        }
-
-                        if (!string.IsNullOrEmpty(transcriptThinking))
-                        {
-                            hasStreamedReasoning = true;
-                            finalThinking = transcriptThinking;
-                            await StreamReasoningInChunksAsync(WriteRawChunkAsync, completionId, createdTimestamp, request.Model, transcriptThinking, cancellationToken);
-                        }
+                        hasToolCalls = true;
+                        await WriteChunkAsync(new ChunkDelta { ToolCalls = extraTools });
                     }
-
-                    var toolProcessed = toolCallProcessor.Process(processed.ContentDelta);
-
-                    if (!string.IsNullOrEmpty(toolProcessed.ContentDelta))
+                    else
                     {
-                        var contentChunk = new ChatCompletionChunk
-                        {
-                            Id = completionId,
-                            Created = createdTimestamp,
-                            Model = request.Model,
-                            Choices =
-                            [
-                                new ChunkChoice
-                                {
-                                    Index = 0,
-                                    Delta = new ChunkDelta { Content = toolProcessed.ContentDelta }
-                                }
-                            ]
-                        };
-
-                        await WriteRawChunkAsync($"data: {JsonSerializer.Serialize(contentChunk)}\n\n");
-                    }
-
-                    if (toolProcessed.NewToolCalls != null && toolProcessed.NewToolCalls.Count > 0)
-                    {
-                        var tcChunk = new ChatCompletionChunk
-                        {
-                            Id = completionId,
-                            Created = createdTimestamp,
-                            Model = request.Model,
-                            Choices =
-                            [
-                                new ChunkChoice
-                                {
-                                    Index = 0,
-                                    Delta = new ChunkDelta
-                                    {
-                                        ToolCalls = toolProcessed.NewToolCalls
-                                    }
-                                }
-                            ]
-                        };
-
-                        await WriteRawChunkAsync($"data: {JsonSerializer.Serialize(tcChunk)}\n\n");
+                        await WriteChunkAsync(new ChunkDelta { Content = finalFullResponse });
+                        fullContent = finalFullResponse;
                     }
                 }
-            }
 
-            if (!string.IsNullOrEmpty(item.Error))
-            {
-                _logger.LogError("Streaming error from AGY: {Error}", item.Error);
-                var errChunk = new ChatCompletionChunk
+                // Fallback to transcript if neither deltas nor result.Response arrived
+                if (string.IsNullOrWhiteSpace(fullContent) && !hasToolCalls && !string.IsNullOrEmpty(recordedConvId))
                 {
-                    Id = completionId,
-                    Created = createdTimestamp,
-                    Model = request.Model,
-                    Choices =
-                    [
-                        new ChunkChoice
-                        {
-                            Index = 0,
-                            Delta = new ChunkDelta { Content = $"\n[Error: {item.Error}]\n" }
-                        }
-                    ]
-                };
-                await WriteRawChunkAsync($"data: {JsonSerializer.Serialize(errChunk)}\n\n");
-            }
-        }
-
-        // Flush any buffered tokens from thought stream processor
-        var flushed = streamProcessor.Flush();
-        if (!string.IsNullOrEmpty(flushed.ReasoningDelta))
-        {
-            hasStreamedReasoning = true;
-            var reasoningChunk = new ChatCompletionChunk
-            {
-                Id = completionId,
-                Created = createdTimestamp,
-                Model = request.Model,
-                Choices =
-                [
-                    new ChunkChoice
+                    var transcriptContent = await _transcriptReader.ExtractLatestResponseAsync(recordedConvId, cancellationToken);
+                    if (!string.IsNullOrWhiteSpace(transcriptContent))
                     {
-                        Index = 0,
-                        Delta = new ChunkDelta
+                        var extraTools = ToolCallStreamProcessor.ExtractToolCalls(transcriptContent);
+                        if (extraTools.Count > 0)
                         {
-                            ReasoningContent = flushed.ReasoningDelta,
-                            Reasoning = flushed.ReasoningDelta
+                            hasToolCalls = true;
+                            await WriteChunkAsync(new ChunkDelta { ToolCalls = extraTools });
+                        }
+                        else
+                        {
+                            await WriteChunkAsync(new ChunkDelta { Content = transcriptContent });
+                            fullContent = transcriptContent;
                         }
                     }
-                ]
-            };
-                    await WriteRawChunkAsync($"data: {JsonSerializer.Serialize(reasoningChunk)}\n\n");
-        }
-        if (!string.IsNullOrEmpty(flushed.ContentDelta))
-        {
-            var toolProcessedFlushed = toolCallProcessor.Process(flushed.ContentDelta);
-            if (!string.IsNullOrEmpty(toolProcessedFlushed.ContentDelta))
-            {
-                var contentChunk = new ChatCompletionChunk
-                {
-                    Id = completionId,
-                    Created = createdTimestamp,
-                    Model = request.Model,
-                    Choices =
-                    [
-                        new ChunkChoice
-                        {
-                            Index = 0,
-                            Delta = new ChunkDelta { Content = toolProcessedFlushed.ContentDelta }
-                        }
-                    ]
-                };
-                await WriteRawChunkAsync($"data: {JsonSerializer.Serialize(contentChunk)}\n\n");
-            }
-
-            if (toolProcessedFlushed.NewToolCalls != null && toolProcessedFlushed.NewToolCalls.Count > 0)
-            {
-                var tcChunk = new ChatCompletionChunk
-                {
-                    Id = completionId,
-                    Created = createdTimestamp,
-                    Model = request.Model,
-                    Choices =
-                    [
-                        new ChunkChoice
-                        {
-                            Index = 0,
-                            Delta = new ChunkDelta { ToolCalls = toolProcessedFlushed.NewToolCalls }
-                        }
-                    ]
-                };
-                await WriteRawChunkAsync($"data: {JsonSerializer.Serialize(tcChunk)}\n\n");
-            }
-        }
-
-        var toolFlushed = toolCallProcessor.Flush();
-        if (!string.IsNullOrEmpty(toolFlushed.ContentDelta))
-        {
-            var contentChunk = new ChatCompletionChunk
-            {
-                Id = completionId,
-                Created = createdTimestamp,
-                Model = request.Model,
-                Choices =
-                [
-                    new ChunkChoice
-                    {
-                        Index = 0,
-                        Delta = new ChunkDelta { Content = toolFlushed.ContentDelta }
-                    }
-                ]
-            };
-            await WriteRawChunkAsync($"data: {JsonSerializer.Serialize(contentChunk)}\n\n");
-        }
-        if (toolFlushed.NewToolCalls != null && toolFlushed.NewToolCalls.Count > 0)
-        {
-            var tcChunk = new ChatCompletionChunk
-            {
-                Id = completionId,
-                Created = createdTimestamp,
-                Model = request.Model,
-                Choices =
-                [
-                    new ChunkChoice
-                    {
-                        Index = 0,
-                        Delta = new ChunkDelta { ToolCalls = toolFlushed.NewToolCalls }
-                    }
-                ]
-            };
-            await WriteRawChunkAsync($"data: {JsonSerializer.Serialize(tcChunk)}\n\n");
-        }
-
-        var fullContent = toolCallProcessor.GetFullContent();
-        var fullThinking = streamProcessor.GetFullThinking();
-        bool hasToolCalls = toolCallProcessor.HasToolCalls;
-
-        // Safety fallback: if no reasoning was streamed, but reasoning was captured in finalThinking, stream it now
-        if (!hasStreamedReasoning && string.IsNullOrEmpty(fullThinking) && !string.IsNullOrEmpty(finalThinking))
-        {
-            hasStreamedReasoning = true;
-            await StreamReasoningInChunksAsync(WriteRawChunkAsync, completionId, createdTimestamp, request.Model, finalThinking, cancellationToken);
-            fullThinking = finalThinking;
-        }
-
-        // If no content or tools were streamed, but we have a final response
-        if (string.IsNullOrEmpty(fullContent) && !hasToolCalls && !string.IsNullOrEmpty(finalFullResponse))
-        {
-            var extraTools = ToolCallStreamProcessor.ExtractToolCalls(finalFullResponse);
-            if (extraTools.Count > 0)
-            {
-                hasToolCalls = true;
-                var tcChunk = new ChatCompletionChunk
-                {
-                    Id = completionId,
-                    Created = createdTimestamp,
-                    Model = request.Model,
-                    Choices =
-                    [
-                        new ChunkChoice
-                        {
-                            Index = 0,
-                            Delta = new ChunkDelta { ToolCalls = extraTools }
-                        }
-                    ]
-                };
-                await WriteRawChunkAsync($"data: {JsonSerializer.Serialize(tcChunk)}\n\n");
-            }
-            else
-            {
-                var contentChunk = new ChatCompletionChunk
-                {
-                    Id = completionId,
-                    Created = createdTimestamp,
-                    Model = request.Model,
-                    Choices =
-                    [
-                        new ChunkChoice
-                        {
-                            Index = 0,
-                            Delta = new ChunkDelta { Content = finalFullResponse }
-                        }
-                    ]
-                };
-                await WriteRawChunkAsync($"data: {JsonSerializer.Serialize(contentChunk)}\n\n");
-                fullContent = finalFullResponse;
-            }
-        }
-
-        // Fallback: check if transcript recorded a response that wasn't streamed
-        if (string.IsNullOrWhiteSpace(fullContent) && !hasToolCalls && !string.IsNullOrEmpty(recordedConvId))
-        {
-            var transcriptContent = await _transcriptReader.ExtractLatestResponseAsync(recordedConvId, cancellationToken);
-            if (!string.IsNullOrWhiteSpace(transcriptContent))
-            {
-                var extraTools = ToolCallStreamProcessor.ExtractToolCalls(transcriptContent);
-                if (extraTools.Count > 0)
-                {
-                    hasToolCalls = true;
-                    var tcChunk = new ChatCompletionChunk
-                    {
-                        Id = completionId,
-                        Created = createdTimestamp,
-                        Model = request.Model,
-                        Choices =
-                        [
-                            new ChunkChoice
-                            {
-                                Index = 0,
-                                Delta = new ChunkDelta { ToolCalls = extraTools }
-                            }
-                        ]
-                    };
-                    await WriteRawChunkAsync($"data: {JsonSerializer.Serialize(tcChunk)}\n\n");
                 }
-                else
+
+                await WriteChunkAsync(new ChunkDelta(), finishReason: hasToolCalls ? "tool_calls" : "stop");
+
+                var (inTokens, outTokens, totTokens) = ComputeTokenCounts(finalUsage, prompt, fullContent, fullThinking);
+
+                if (request.StreamOptions?.IncludeUsage == true)
                 {
-                    var contentChunk = new ChatCompletionChunk
-                    {
-                        Id = completionId,
-                        Created = createdTimestamp,
-                        Model = request.Model,
-                        Choices =
-                        [
-                            new ChunkChoice
-                            {
-                                Index = 0,
-                                Delta = new ChunkDelta { Content = transcriptContent }
-                            }
-                        ]
-                    };
-                    await WriteRawChunkAsync($"data: {JsonSerializer.Serialize(contentChunk)}\n\n");
-                    fullContent = transcriptContent;
+                    await WriteChunkAsync(
+                        new ChunkDelta(),
+                        usage: new UsageStatistics
+                        {
+                            PromptTokens = inTokens,
+                            CompletionTokens = outTokens,
+                            TotalTokens = totTokens
+                        },
+                        emptyChoices: true);
                 }
+
+                await WriteRawAsync("data: [DONE]\n\n", cancellationToken);
             }
-        }
 
-        // Absolute fail-safe: Ensure client (e.g. Hermes) NEVER receives an empty message that breaks the conversation loop (only if no tools called)
-        if (string.IsNullOrWhiteSpace(fullContent) && !hasToolCalls)
-        {
-            var fallbackText = !string.IsNullOrWhiteSpace(fullThinking)
-                ? $"Based on my reasoning:\n\n{fullThinking}"
-                : "I processed your request, but was unable to produce a complete response. Please try again.";
-
-            var fallbackChunk = new ChatCompletionChunk
-            {
-                Id = completionId,
-                Created = createdTimestamp,
-                Model = request.Model,
-                Choices =
-                [
-                    new ChunkChoice
-                    {
-                        Index = 0,
-                        Delta = new ChunkDelta { Content = fallbackText }
-                    }
-                ]
-            };
-            await WriteRawChunkAsync($"data: {JsonSerializer.Serialize(fallbackChunk)}\n\n");
-            fullContent = fallbackText;
-        }
-
-        // Send finish chunk
-        var finishChunk = new ChatCompletionChunk
-        {
-            Id = completionId,
-            Created = createdTimestamp,
-            Model = request.Model,
-            Choices =
-            [
-                new ChunkChoice
-                {
-                    Index = 0,
-                    Delta = new ChunkDelta(),
-                    FinishReason = hasToolCalls ? "tool_calls" : "stop"
-                }
-            ]
-        };
-        await WriteRawChunkAsync($"data: {JsonSerializer.Serialize(finishChunk)}\n\n");
-
-        var inTokens = (finalUsage != null && finalUsage.InputTokens > 0) ? finalUsage.InputTokens : Math.Max(1, prompt.Length / 4);
-        var outTokens = (finalUsage != null && finalUsage.OutputTokens > 0) ? finalUsage.OutputTokens : Math.Max(1, (fullContent.Length + fullThinking.Length) / 4);
-        var totTokens = (finalUsage != null && finalUsage.TotalTokens > 0) ? finalUsage.TotalTokens : (inTokens + outTokens);
-
-        // Optional usage chunk for OpenAI streaming options
-        if (request.StreamOptions?.IncludeUsage == true)
-        {
-            var usageChunk = new ChatCompletionChunk
-            {
-                Id = completionId,
-                Created = createdTimestamp,
-                Model = request.Model,
-                Choices = [],
-                Usage = new UsageStatistics
-                {
-                    PromptTokens = inTokens,
-                    CompletionTokens = outTokens,
-                    TotalTokens = totTokens
-                }
-            };
-            await WriteRawChunkAsync($"data: {JsonSerializer.Serialize(usageChunk)}\n\n");
-        }
-
-        await WriteRawChunkAsync("data: [DONE]\n\n");
-
-        // Record usage against authenticated API key
-        if (context.Items.TryGetValue("AuthApiKeyId", out var kIdObj) && kIdObj is string authKeyId)
-        {
-            await _usageRecorder.RecordUsageAsync(authKeyId, inTokens, outTokens, totTokens);
-        }
-
-        return Results.Empty;
+            return Results.Empty;
         }
         finally
         {
-            keepAliveCts.Cancel();
+            await keepAliveCts.CancelAsync();
             try
             {
                 await keepAliveTask;
             }
             catch
             {
-                // ignore cancellation
+                // ignored
+            }
+
+            // Always record usage (even if the client disconnected mid-stream)
+            if (context.Items.TryGetValue("AuthApiKeyId", out var kIdObj) && kIdObj is string authKeyId)
+            {
+                var recordedContent = !string.IsNullOrEmpty(toolCallProcessor.GetFullContent())
+                    ? toolCallProcessor.GetFullContent()
+                    : (finalFullResponse ?? string.Empty);
+                var recordedThinking = !string.IsNullOrEmpty(streamProcessor.GetFullThinking())
+                    ? streamProcessor.GetFullThinking()
+                    : (finalThinking ?? string.Empty);
+
+                var (inTokens, outTokens, totTokens) = ComputeTokenCounts(finalUsage, prompt, recordedContent, recordedThinking);
+                await _usageRecorder.RecordUsageAsync(authKeyId, inTokens, outTokens, totTokens);
             }
         }
     }
@@ -738,35 +471,35 @@ public class ChatCompletionHandler : IChatCompletionHandler
         string completionId,
         long createdTimestamp,
         bool emitTagsInContent,
+        bool emitReasoningFields,
         string prompt,
         CancellationToken cancellationToken)
     {
         var result = await _agyProcess.ExecutePromptAsync(executionRequest, cancellationToken);
 
-        if (!string.IsNullOrEmpty(result.ConversationId) && !string.IsNullOrEmpty(sessionKey))
+        if (!string.IsNullOrEmpty(result.ConversationId))
         {
-            _sessionManager.SetConversationId(sessionKey, result.ConversationId);
-            completionId = "chatcmpl-" + result.ConversationId;
+            if (!string.IsNullOrEmpty(sessionKey))
+            {
+                _sessionManager.SetConversationId(sessionKey, result.ConversationId);
+            }
             context.Response.Headers.Append("X-Conversation-Id", result.ConversationId);
         }
 
         if (!string.IsNullOrEmpty(result.Error))
         {
-            return Results.Json(new
-            {
-                error = new
-                {
-                    message = result.Error,
-                    type = "server_error",
-                    code = "agy_error"
-                }
-            }, statusCode: StatusCodes.Status500InternalServerError);
+            return CreateErrorResult(
+                StatusCodes.Status500InternalServerError,
+                result.Error,
+                "server_error",
+                null,
+                "agy_error");
         }
 
-        // Process thinking and content
         var rawResponse = result.FullResponse ?? string.Empty;
         var processor = new ThoughtStreamProcessor(emitTagsInContent);
         processor.Process(rawResponse);
+        processor.Flush();
 
         var thinking = processor.GetFullThinking();
         if (string.IsNullOrEmpty(thinking) && !string.IsNullOrEmpty(result.Thinking))
@@ -777,8 +510,7 @@ public class ChatCompletionHandler : IChatCompletionHandler
         string finalContent;
         if (emitTagsInContent)
         {
-            // If thinking was only found via transcript fallback and not in rawResponse, prepend <think> tag
-            if (!string.IsNullOrEmpty(thinking) && !rawResponse.Contains("<think>") && !rawResponse.Contains("<thought>"))
+            if (!string.IsNullOrEmpty(thinking) && !rawResponse.Contains("<think>", StringComparison.OrdinalIgnoreCase) && !rawResponse.Contains("<thought>", StringComparison.OrdinalIgnoreCase))
             {
                 finalContent = $"<think>\n{thinking}\n</think>\n\n{rawResponse.TrimStart()}";
             }
@@ -792,7 +524,7 @@ public class ChatCompletionHandler : IChatCompletionHandler
             finalContent = processor.GetFullContent();
         }
 
-        if (string.IsNullOrWhiteSpace(finalContent) && !string.IsNullOrWhiteSpace(result.FullResponse))
+        if (string.IsNullOrWhiteSpace(finalContent) && !string.IsNullOrWhiteSpace(result.FullResponse) && !processor.HasSeenThinking)
         {
             finalContent = result.FullResponse;
         }
@@ -814,16 +546,7 @@ public class ChatCompletionHandler : IChatCompletionHandler
             finalContent = ToolCallStreamProcessor.RemoveToolCallTags(finalContent);
         }
 
-        if (string.IsNullOrWhiteSpace(finalContent) && !hasToolCalls)
-        {
-            finalContent = !string.IsNullOrWhiteSpace(thinking)
-                ? $"Based on my reasoning:\n\n{thinking}"
-                : "I processed your request, but was unable to produce a complete response. Please try again.";
-        }
-
-        var inTokens = (result.Usage != null && result.Usage.InputTokens > 0) ? result.Usage.InputTokens : Math.Max(1, prompt.Length / 4);
-        var outTokens = (result.Usage != null && result.Usage.OutputTokens > 0) ? result.Usage.OutputTokens : Math.Max(1, ((finalContent?.Length ?? 0) + (thinking?.Length ?? 0)) / 4);
-        var totTokens = (result.Usage != null && result.Usage.TotalTokens > 0) ? result.Usage.TotalTokens : (inTokens + outTokens);
+        var (inTokens, outTokens, totTokens) = ComputeTokenCounts(result.Usage, prompt, finalContent, thinking);
 
         var response = new ChatCompletionResponse
         {
@@ -839,8 +562,8 @@ public class ChatCompletionHandler : IChatCompletionHandler
                     {
                         Role = "assistant",
                         Content = !string.IsNullOrWhiteSpace(finalContent) ? finalContent : (hasToolCalls ? null : string.Empty),
-                        ReasoningContent = !string.IsNullOrEmpty(thinking) ? thinking : null,
-                        Reasoning = !string.IsNullOrEmpty(thinking) ? thinking : null,
+                        ReasoningContent = emitReasoningFields && !string.IsNullOrEmpty(thinking) ? thinking : null,
+                        Reasoning = _options.EmitLegacyReasoningField && emitReasoningFields && !string.IsNullOrEmpty(thinking) ? thinking : null,
                         ToolCalls = hasToolCalls ? extractedTools : null
                     },
                     FinishReason = hasToolCalls ? "tool_calls" : "stop"
@@ -862,85 +585,63 @@ public class ChatCompletionHandler : IChatCompletionHandler
         return Results.Ok(response);
     }
 
-    private static async Task StreamReasoningInChunksAsync(
-        Func<string, Task> writeRawChunk,
-        string completionId,
-        long createdTimestamp,
-        string model,
+    private static async Task EmitThinkingImmediateAsync(
+        Func<ChunkDelta, string?, UsageStatistics?, bool, Task> writeChunk,
+        Func<string, ChunkDelta> createReasoningDelta,
         string thinking,
-        CancellationToken cancellationToken)
+        bool emitReasoningFields,
+        bool emitTagsInContent)
     {
         if (string.IsNullOrWhiteSpace(thinking)) return;
 
-        var chunks = SplitIntoThinkingChunks(thinking, 80);
-        var delayMs = Math.Clamp(250 / Math.Max(1, chunks.Count), 2, 8);
-
-        foreach (var chunkText in chunks)
+        if (emitReasoningFields)
         {
-            if (cancellationToken.IsCancellationRequested) break;
-
-            var reasoningChunk = new ChatCompletionChunk
-            {
-                Id = completionId,
-                Created = createdTimestamp,
-                Model = model,
-                Choices =
-                [
-                    new ChunkChoice
-                    {
-                        Index = 0,
-                        Delta = new ChunkDelta
-                        {
-                            ReasoningContent = chunkText,
-                            Reasoning = chunkText
-                        }
-                    }
-                ]
-            };
-
-            await writeRawChunk($"data: {JsonSerializer.Serialize(reasoningChunk)}\n\n");
-            if (delayMs > 0)
-            {
-                await Task.Delay(delayMs, cancellationToken);
-            }
+            await writeChunk(createReasoningDelta(thinking), null, null, false);
+        }
+        if (emitTagsInContent && !emitReasoningFields)
+        {
+            await writeChunk(new ChunkDelta { Content = $"<think>\n{thinking}\n</think>\n\n" }, null, null, false);
         }
     }
 
-    private static List<string> SplitIntoThinkingChunks(string text, int targetChunkSize = 25)
+    private static (int InputTokens, int OutputTokens, int TotalTokens) ComputeTokenCounts(
+        AgyUsage? usage,
+        string prompt,
+        string? content,
+        string? thinking)
     {
-        var chunks = new List<string>();
-        if (string.IsNullOrEmpty(text))
-            return chunks;
+        var inTokens = usage is { InputTokens: > 0 }
+            ? usage.InputTokens
+            : Math.Max(1, prompt.Length / 4);
 
-        int index = 0;
-        while (index < text.Length)
+        int outTokens;
+        if (usage != null && (usage.OutputTokens > 0 || usage.ThinkingTokens > 0))
         {
-            int remaining = text.Length - index;
-            if (remaining <= targetChunkSize)
-            {
-                chunks.Add(text.Substring(index));
-                break;
-            }
-
-            int minSearch = (int)(targetChunkSize * 0.7);
-            int maxSearch = Math.Min((int)(targetChunkSize * 1.3), remaining);
-            int bestBreak = -1;
-
-            for (int i = minSearch; i <= maxSearch; i++)
-            {
-                char c = text[index + i - 1];
-                if (c == ' ' || c == '\n' || c == '.' || c == ',' || c == ';' || c == '!' || c == '?')
-                {
-                    bestBreak = i;
-                    if (c == ' ' || c == '\n') break;
-                }
-            }
-
-            int chunkSize = bestBreak > 0 ? bestBreak : targetChunkSize;
-            chunks.Add(text.Substring(index, chunkSize));
-            index += chunkSize;
+            outTokens = usage.OutputTokens + usage.ThinkingTokens;
+        }
+        else
+        {
+            outTokens = Math.Max(1, ((content?.Length ?? 0) + (thinking?.Length ?? 0)) / 4);
         }
 
-        return chunks;
+        var totTokens = usage is { TotalTokens: > 0 }
+            ? Math.Max(usage.TotalTokens, inTokens + outTokens)
+            : inTokens + outTokens;
+
+        return (inTokens, outTokens, totTokens);
+    }
+
+    private static IResult CreateErrorResult(int statusCode, string message, string type, string? param, string code)
+    {
+        return Results.Json(new
+        {
+            error = new
+            {
+                message,
+                type,
+                param,
+                code
+            }
+        }, statusCode: statusCode);
     }
 }

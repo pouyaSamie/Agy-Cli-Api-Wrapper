@@ -1,169 +1,264 @@
+using System.Buffers;
+using System.Text;
 using System.Text.Json;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace AgyApi.Infrastructure.Agy;
 
 public class AgyTranscriptReader : IAgyTranscriptReader
 {
+    private const int ChunkSize = 32 * 1024;
     private readonly ILogger<AgyTranscriptReader> _logger;
-    private readonly string _cliBrainBase;
-    private readonly string _ideBrainBase;
+    private readonly string[] _brainBaseDirs;
 
+    [ActivatorUtilitiesConstructor]
     public AgyTranscriptReader(ILogger<AgyTranscriptReader> logger)
+        : this(logger, GetDefaultBrainBaseDirs())
+    {
+    }
+
+    internal AgyTranscriptReader(ILogger<AgyTranscriptReader> logger, params string[] brainBaseDirs)
     {
         _logger = logger;
+        _brainBaseDirs = brainBaseDirs
+            .Where(d => !string.IsNullOrWhiteSpace(d))
+            .Select(Path.GetFullPath)
+            .ToArray();
+    }
+
+    private static string[] GetDefaultBrainBaseDirs()
+    {
         var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        _cliBrainBase = Path.Combine(userProfile, ".gemini", "antigravity-cli", "brain");
-        _ideBrainBase = Path.Combine(userProfile, ".gemini", "antigravity", "brain");
+        return
+        [
+            Path.Combine(userProfile, ".gemini", "antigravity-cli", "brain"),
+            Path.Combine(userProfile, ".gemini", "antigravity", "brain")
+        ];
     }
 
-    public async Task<string?> ExtractThinkingAsync(string conversationId, CancellationToken cancellationToken = default)
+    public Task<string?> ExtractThinkingAsync(string conversationId, CancellationToken cancellationToken = default)
+        => ExtractLatestFieldAsync(conversationId, "thinking", cancellationToken);
+
+    public Task<string?> ExtractLatestResponseAsync(string conversationId, CancellationToken cancellationToken = default)
+        => ExtractLatestFieldAsync(conversationId, "content", cancellationToken);
+
+    private async Task<string?> ExtractLatestFieldAsync(
+        string conversationId,
+        string propertyName,
+        CancellationToken cancellationToken)
     {
-        if (string.IsNullOrWhiteSpace(conversationId))
+        if (!AgyProcessHelpers.IsValidConversationId(conversationId))
+        {
+            _logger.LogWarning("Rejected invalid conversationId for transcript lookup.");
             return null;
+        }
 
-        var potentialPaths = new[]
+        foreach (var baseDir in _brainBaseDirs)
         {
-            Path.Combine(_cliBrainBase, conversationId, ".system_generated", "logs", "transcript_full.jsonl"),
-            Path.Combine(_cliBrainBase, conversationId, ".system_generated", "logs", "transcript.jsonl"),
-            Path.Combine(_ideBrainBase, conversationId, ".system_generated", "logs", "transcript_full.jsonl"),
-            Path.Combine(_ideBrainBase, conversationId, ".system_generated", "logs", "transcript.jsonl")
-        };
+            var normalizedBase = baseDir.EndsWith(Path.DirectorySeparatorChar)
+                ? baseDir
+                : baseDir + Path.DirectorySeparatorChar;
 
-        foreach (var path in potentialPaths)
-        {
-            if (!File.Exists(path))
-                continue;
-
-            try
+            foreach (var fileName in new[] { "transcript_full.jsonl", "transcript.jsonl" })
             {
-                using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-                using var reader = new StreamReader(fs);
+                var candidatePath = Path.GetFullPath(
+                    Path.Combine(baseDir, conversationId, ".system_generated", "logs", fileName));
 
-                var lines = new List<string>();
-                string? line;
-                while ((line = await reader.ReadLineAsync(cancellationToken)) != null)
+                // Path-jail verification
+                if (!candidatePath.StartsWith(normalizedBase, StringComparison.Ordinal))
                 {
-                    if (!string.IsNullOrWhiteSpace(line))
-                    {
-                        lines.Add(line);
-                    }
+                    _logger.LogWarning("Blocked transcript path traversal attempt for conversationId {ConvId}", conversationId);
+                    return null;
                 }
 
-                // Search from bottom up for the latest PLANNER_RESPONSE with thinking
-                for (int i = lines.Count - 1; i >= 0; i--)
-                {
-                    try
-                    {
-                        using var doc = JsonDocument.Parse(lines[i]);
-                        var root = doc.RootElement;
+                if (!File.Exists(candidatePath))
+                    continue;
 
-                        if (root.TryGetProperty("type", out var typeProp))
-                        {
-                            var typeStr = typeProp.GetString();
-                            if (typeStr == "PLANNER_RESPONSE" &&
-                                root.TryGetProperty("thinking", out var thinkingProp))
-                            {
-                                var thinking = thinkingProp.GetString();
-                                if (!string.IsNullOrWhiteSpace(thinking))
-                                {
-                                    _logger.LogDebug("Extracted thinking ({Length} chars) from transcript {Path}", thinking.Length, path);
-                                    return thinking.Trim();
-                                }
-                            }
-                            else if (typeStr == "USER_INPUT")
-                            {
-                                // We reached the boundary of the current turn; do not leak thinking from earlier turns
-                                break;
-                            }
-                        }
-                    }
-                    catch (JsonException)
+                try
+                {
+                    var extracted = await ScanReverseForLatestFieldAsync(candidatePath, propertyName, cancellationToken);
+                    if (!string.IsNullOrWhiteSpace(extracted))
                     {
-                        // Ignore individual malformed line
+                        _logger.LogDebug("Extracted {Property} ({Length} chars) from transcript {Path}",
+                            propertyName, extracted.Length, candidatePath);
+                        return extracted;
                     }
                 }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Failed reading transcript file at {Path}", path);
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed reading transcript file at {Path}", candidatePath);
+                }
             }
         }
 
         return null;
     }
 
-    public async Task<string?> ExtractLatestResponseAsync(string conversationId, CancellationToken cancellationToken = default)
+    /// <summary>
+    /// Scans a JSONL file backwards from EOF in 32 KB chunks, splitting on UTF-8 newline bytes (0x0A)
+    /// and stopping immediately upon reaching the current turn's USER_INPUT boundary.
+    /// </summary>
+    private static async Task<string?> ScanReverseForLatestFieldAsync(
+        string path,
+        string propertyName,
+        CancellationToken cancellationToken)
     {
-        if (string.IsNullOrWhiteSpace(conversationId))
-            return null;
+        await using var fs = new FileStream(
+            path,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.ReadWrite,
+            bufferSize: ChunkSize,
+            FileOptions.Asynchronous);
 
-        var potentialPaths = new[]
+        long position = fs.Length;
+        if (position == 0) return null;
+
+        byte[] readBuffer = ArrayPool<byte>.Shared.Rent(ChunkSize);
+        byte[] carry = [];
+
+        try
         {
-            Path.Combine(_cliBrainBase, conversationId, ".system_generated", "logs", "transcript_full.jsonl"),
-            Path.Combine(_cliBrainBase, conversationId, ".system_generated", "logs", "transcript.jsonl"),
-            Path.Combine(_ideBrainBase, conversationId, ".system_generated", "logs", "transcript_full.jsonl"),
-            Path.Combine(_ideBrainBase, conversationId, ".system_generated", "logs", "transcript.jsonl")
-        };
-
-        foreach (var path in potentialPaths)
-        {
-            if (!File.Exists(path))
-                continue;
-
-            try
+            while (position > 0)
             {
-                using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-                using var reader = new StreamReader(fs);
+                cancellationToken.ThrowIfCancellationRequested();
 
-                var lines = new List<string>();
-                string? line;
-                while ((line = await reader.ReadLineAsync(cancellationToken)) != null)
+                int toRead = (int)Math.Min(ChunkSize, position);
+                position -= toRead;
+                fs.Seek(position, SeekOrigin.Begin);
+
+                int bytesRead = 0;
+                while (bytesRead < toRead)
                 {
-                    if (!string.IsNullOrWhiteSpace(line))
-                    {
-                        lines.Add(line);
-                    }
+                    int read = await fs.ReadAsync(readBuffer.AsMemory(bytesRead, toRead - bytesRead), cancellationToken);
+                    if (read == 0) break;
+                    bytesRead += read;
                 }
 
-                // Search from bottom up for the latest PLANNER_RESPONSE with content
-                for (int i = lines.Count - 1; i >= 0; i--)
-                {
-                    try
-                    {
-                        using var doc = JsonDocument.Parse(lines[i]);
-                        var root = doc.RootElement;
+                if (bytesRead == 0) break;
 
-                        if (root.TryGetProperty("type", out var typeProp))
+                int segmentEnd = bytesRead;
+                bool usedCarry = false;
+
+                for (int i = bytesRead - 1; i >= 0; i--)
+                {
+                    if (readBuffer[i] == (byte)'\n')
+                    {
+                        var lineBytes = BuildLineBytes(readBuffer, i + 1, segmentEnd - (i + 1), !usedCarry ? carry : []);
+                        usedCarry = true;
+                        segmentEnd = i;
+
+                        if (TryInspectLine(lineBytes, propertyName, out var foundValue, out var hitUserBoundary))
                         {
-                            var typeStr = typeProp.GetString();
-                            if (typeStr == "PLANNER_RESPONSE" &&
-                                root.TryGetProperty("content", out var contentProp))
-                            {
-                                var content = contentProp.GetString();
-                                if (!string.IsNullOrWhiteSpace(content))
-                                {
-                                    _logger.LogDebug("Extracted content ({Length} chars) from transcript {Path}", content.Length, path);
-                                    return content.Trim();
-                                }
-                            }
-                            else if (typeStr == "USER_INPUT")
-                            {
-                                break;
-                            }
+                            return foundValue;
+                        }
+                        if (hitUserBoundary)
+                        {
+                            return null;
                         }
                     }
-                    catch (JsonException)
-                    {
-                        // Ignore individual malformed line
-                    }
                 }
+
+                // Remaining prefix [0..segmentEnd) is either the start of a line split across chunks
+                // or the very first line of the file (when position == 0)
+                var prefixBytes = BuildLineBytes(readBuffer, 0, segmentEnd, !usedCarry ? carry : []);
+
+                if (position == 0)
+                {
+                    if (TryInspectLine(prefixBytes, propertyName, out var foundValue, out _))
+                    {
+                        return foundValue;
+                    }
+                    break;
+                }
+
+                carry = prefixBytes;
             }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Failed reading transcript file at {Path}", path);
-            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(readBuffer);
         }
 
         return null;
+    }
+
+    private static byte[] BuildLineBytes(byte[] buffer, int offset, int count, byte[] suffix)
+    {
+        if (count == 0 && suffix.Length == 0) return [];
+        if (suffix.Length == 0)
+        {
+            var result = new byte[count];
+            Buffer.BlockCopy(buffer, offset, result, 0, count);
+            return result;
+        }
+        if (count == 0)
+        {
+            return suffix;
+        }
+
+        var combined = new byte[count + suffix.Length];
+        Buffer.BlockCopy(buffer, offset, combined, 0, count);
+        Buffer.BlockCopy(suffix, 0, combined, count, suffix.Length);
+        return combined;
+    }
+
+    private static bool TryInspectLine(byte[] lineBytes, string propertyName, out string? foundValue, out bool hitUserBoundary)
+    {
+        foundValue = null;
+        hitUserBoundary = false;
+
+        if (lineBytes.Length == 0) return false;
+
+        // Trim trailing CR/whitespace
+        int end = lineBytes.Length;
+        while (end > 0 && (lineBytes[end - 1] == (byte)'\r' || lineBytes[end - 1] == (byte)' ' || lineBytes[end - 1] == (byte)'\t'))
+        {
+            end--;
+        }
+        int start = 0;
+        while (start < end && (lineBytes[start] == (byte)' ' || lineBytes[start] == (byte)'\t'))
+        {
+            start++;
+        }
+        if (start >= end) return false;
+
+        try
+        {
+            var lineSpan = lineBytes.AsMemory(start, end - start);
+            using var doc = JsonDocument.Parse(lineSpan);
+            var root = doc.RootElement;
+
+            if (root.ValueKind == JsonValueKind.Object && root.TryGetProperty("type", out var typeProp))
+            {
+                var typeStr = typeProp.GetString();
+                if (typeStr == "PLANNER_RESPONSE" &&
+                    root.TryGetProperty(propertyName, out var prop) &&
+                    prop.ValueKind == JsonValueKind.String)
+                {
+                    var val = prop.GetString();
+                    if (!string.IsNullOrWhiteSpace(val))
+                    {
+                        foundValue = val.Trim();
+                        return true;
+                    }
+                }
+                else if (typeStr == "USER_INPUT")
+                {
+                    hitUserBoundary = true;
+                    return false;
+                }
+            }
+        }
+        catch (JsonException)
+        {
+            // Ignore malformed individual line
+        }
+
+        return false;
     }
 }

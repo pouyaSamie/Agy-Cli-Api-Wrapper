@@ -4,10 +4,17 @@ namespace AgyApi.Features.ChatCompletions;
 
 public class ThoughtStreamProcessor : IThoughtStreamProcessor
 {
+    private static readonly string[] StartTags = ["<think>", "<thought>", "<reasoning>"];
+    private static readonly string[] EndTags = ["</think>", "</thought>", "</reasoning>"];
+    private const int MaxStartTagLen = 11; // "<reasoning>".Length
+    private const int MaxEndTagLen = 12;   // "</reasoning>".Length
+
     private readonly bool _emitTagsInContent;
     private readonly StringBuilder _buffer = new();
     private readonly StringBuilder _allThinking = new();
     private readonly StringBuilder _allContent = new();
+    private readonly StringBuilder _contentOut = new();
+    private readonly StringBuilder _reasoningOut = new();
     private bool _insideThink;
 
     public bool HasSeenThinking => _allThinking.Length > 0 || _insideThink;
@@ -25,124 +32,126 @@ public class ThoughtStreamProcessor : IThoughtStreamProcessor
             return new ProcessedChunk(null, null, _insideThink);
         }
 
-        _buffer.Append(incomingDelta);
-        var text = _buffer.ToString();
-        _buffer.Clear();
+        string text;
+        if (_buffer.Length == 0)
+        {
+            text = incomingDelta;
+        }
+        else
+        {
+            _buffer.Append(incomingDelta);
+            text = _buffer.ToString();
+            _buffer.Clear();
+        }
 
-        string? contentOut = null;
-        string? reasoningOut = null;
+        _contentOut.Clear();
+        _reasoningOut.Clear();
 
-        while (!string.IsNullOrEmpty(text))
+        ReadOnlySpan<char> remaining = text.AsSpan();
+
+        while (!remaining.IsEmpty)
         {
             if (!_insideThink)
             {
-                // Check for start of think/thought tag
-                int thinkStart = IndexOfTag(text, out string startTag);
-
+                int thinkStart = IndexOfTag(remaining, StartTags, out int tagLen);
                 if (thinkStart >= 0)
                 {
-                    // Emit any content before the tag
                     if (thinkStart > 0)
                     {
-                        var before = text[..thinkStart];
-                        contentOut = (contentOut ?? "") + before;
+                        var before = remaining[..thinkStart];
+                        _contentOut.Append(before);
                         _allContent.Append(before);
                     }
 
                     _insideThink = true;
                     if (_emitTagsInContent)
                     {
-                        contentOut = (contentOut ?? "") + startTag;
+                        _contentOut.Append(remaining.Slice(thinkStart, tagLen));
                     }
 
-                    text = text[(thinkStart + startTag.Length)..];
+                    remaining = remaining[(thinkStart + tagLen)..];
                 }
                 else
                 {
-                    // Check if the end of text could be a partial start tag (e.g. "<th", "<think")
-                    int partialIndex = CheckPartialStartTag(text);
+                    int partialIndex = CheckPartialTag(remaining, StartTags, MaxStartTagLen);
                     if (partialIndex >= 0)
                     {
-                        var safe = text[..partialIndex];
-                        if (!string.IsNullOrEmpty(safe))
+                        if (partialIndex > 0)
                         {
-                            contentOut = (contentOut ?? "") + safe;
+                            var safe = remaining[..partialIndex];
+                            _contentOut.Append(safe);
                             _allContent.Append(safe);
                         }
-                        _buffer.Append(text[partialIndex..]);
+                        _buffer.Append(remaining[partialIndex..]);
                         break;
                     }
 
-                    // No tag in sight, all normal content
-                    contentOut = (contentOut ?? "") + text;
-                    _allContent.Append(text);
-                    text = string.Empty;
+                    _contentOut.Append(remaining);
+                    _allContent.Append(remaining);
+                    break;
                 }
             }
-            else // _insideThink == true
+            else
             {
-                // Check for end of think/thought tag
-                int thinkEnd = IndexOfEndTag(text, out string endTag);
-
+                int thinkEnd = IndexOfTag(remaining, EndTags, out int tagLen);
                 if (thinkEnd >= 0)
                 {
-                    // Text before the closing tag is reasoning
                     if (thinkEnd > 0)
                     {
-                        var thoughtChunk = text[..thinkEnd];
-                        reasoningOut = (reasoningOut ?? "") + thoughtChunk;
+                        var thoughtChunk = remaining[..thinkEnd];
+                        _reasoningOut.Append(thoughtChunk);
                         _allThinking.Append(thoughtChunk);
 
                         if (_emitTagsInContent)
                         {
-                            contentOut = (contentOut ?? "") + thoughtChunk;
+                            _contentOut.Append(thoughtChunk);
                         }
                     }
 
                     _insideThink = false;
                     if (_emitTagsInContent)
                     {
-                        contentOut = (contentOut ?? "") + endTag;
+                        _contentOut.Append(remaining.Slice(thinkEnd, tagLen));
                     }
 
-                    text = text[(thinkEnd + endTag.Length)..];
+                    remaining = remaining[(thinkEnd + tagLen)..];
                 }
                 else
                 {
-                    // Check if end of text is a partial closing tag (e.g. "</th", "</think")
-                    int partialEnd = CheckPartialEndTag(text);
+                    int partialEnd = CheckPartialTag(remaining, EndTags, MaxEndTagLen);
                     if (partialEnd >= 0)
                     {
-                        var safe = text[..partialEnd];
-                        if (!string.IsNullOrEmpty(safe))
+                        if (partialEnd > 0)
                         {
-                            reasoningOut = (reasoningOut ?? "") + safe;
+                            var safe = remaining[..partialEnd];
+                            _reasoningOut.Append(safe);
                             _allThinking.Append(safe);
 
                             if (_emitTagsInContent)
                             {
-                                contentOut = (contentOut ?? "") + safe;
+                                _contentOut.Append(safe);
                             }
                         }
-                        _buffer.Append(text[partialEnd..]);
+                        _buffer.Append(remaining[partialEnd..]);
                         break;
                     }
 
-                    // Still completely inside thinking
-                    reasoningOut = (reasoningOut ?? "") + text;
-                    _allThinking.Append(text);
+                    _reasoningOut.Append(remaining);
+                    _allThinking.Append(remaining);
 
                     if (_emitTagsInContent)
                     {
-                        contentOut = (contentOut ?? "") + text;
+                        _contentOut.Append(remaining);
                     }
-
-                    text = string.Empty;
+                    break;
                 }
             }
         }
 
-        return new ProcessedChunk(contentOut, reasoningOut, _insideThink);
+        return new ProcessedChunk(
+            _contentOut.Length > 0 ? _contentOut.ToString() : null,
+            _reasoningOut.Length > 0 ? _reasoningOut.ToString() : null,
+            _insideThink);
     }
 
     public ProcessedChunk Flush()
@@ -160,103 +169,48 @@ public class ThoughtStreamProcessor : IThoughtStreamProcessor
             _allThinking.Append(remaining);
             return new ProcessedChunk(_emitTagsInContent ? remaining : null, remaining, _insideThink);
         }
-        else
-        {
-            _allContent.Append(remaining);
-            return new ProcessedChunk(remaining, null, _insideThink);
-        }
+
+        _allContent.Append(remaining);
+        return new ProcessedChunk(remaining, null, _insideThink);
     }
 
     public string GetFullThinking() => _allThinking.ToString().Trim();
     public string GetFullContent() => _allContent.ToString().Trim();
 
-    private static int IndexOfTag(string text, out string matchedTag)
+    private static int IndexOfTag(ReadOnlySpan<char> span, string[] tags, out int matchedLength)
     {
-        int idx1 = text.IndexOf("<think>", StringComparison.OrdinalIgnoreCase);
-        int idx2 = text.IndexOf("<thought>", StringComparison.OrdinalIgnoreCase);
-        int idx3 = text.IndexOf("<reasoning>", StringComparison.OrdinalIgnoreCase);
-
         int minIdx = -1;
-        matchedTag = string.Empty;
+        matchedLength = 0;
 
-        if (idx1 >= 0)
+        foreach (var tag in tags)
         {
-            minIdx = idx1;
-            matchedTag = text.Substring(idx1, 7);
-        }
-        if (idx2 >= 0 && (minIdx < 0 || idx2 < minIdx))
-        {
-            minIdx = idx2;
-            matchedTag = text.Substring(idx2, 9);
-        }
-        if (idx3 >= 0 && (minIdx < 0 || idx3 < minIdx))
-        {
-            minIdx = idx3;
-            matchedTag = text.Substring(idx3, 11);
+            int idx = span.IndexOf(tag.AsSpan(), StringComparison.OrdinalIgnoreCase);
+            if (idx >= 0 && (minIdx < 0 || idx < minIdx))
+            {
+                minIdx = idx;
+                matchedLength = tag.Length;
+            }
         }
 
         return minIdx;
     }
 
-    private static int IndexOfEndTag(string text, out string matchedTag)
+    private static int CheckPartialTag(ReadOnlySpan<char> span, string[] candidateTags, int maxTagLen)
     {
-        int idx1 = text.IndexOf("</think>", StringComparison.OrdinalIgnoreCase);
-        int idx2 = text.IndexOf("</thought>", StringComparison.OrdinalIgnoreCase);
-        int idx3 = text.IndexOf("</reasoning>", StringComparison.OrdinalIgnoreCase);
-
-        int minIdx = -1;
-        matchedTag = string.Empty;
-
-        if (idx1 >= 0)
+        // Check longest possible suffix first; allow len == span.Length so 1-char "<" tokens are buffered
+        int maxCheck = Math.Min(span.Length, maxTagLen - 1);
+        for (int len = maxCheck; len >= 1; len--)
         {
-            minIdx = idx1;
-            matchedTag = text.Substring(idx1, 8);
-        }
-        if (idx2 >= 0 && (minIdx < 0 || idx2 < minIdx))
-        {
-            minIdx = idx2;
-            matchedTag = text.Substring(idx2, 10);
-        }
-        if (idx3 >= 0 && (minIdx < 0 || idx3 < minIdx))
-        {
-            minIdx = idx3;
-            matchedTag = text.Substring(idx3, 12);
-        }
-
-        return minIdx;
-    }
-
-    private static int CheckPartialStartTag(string text)
-    {
-        var candidateTags = new[] { "<think>", "<thought>", "<reasoning>" };
-        for (int i = 1; i < text.Length && i < 12; i++)
-        {
-            var tail = text[^i..];
+            var tail = span[^len..];
             foreach (var tag in candidateTags)
             {
-                if (tag.StartsWith(tail, StringComparison.OrdinalIgnoreCase))
+                if (len < tag.Length && tag.AsSpan().StartsWith(tail, StringComparison.OrdinalIgnoreCase))
                 {
-                    return text.Length - i;
+                    return span.Length - len;
                 }
             }
         }
-        return -1;
-    }
 
-    private static int CheckPartialEndTag(string text)
-    {
-        var candidateTags = new[] { "</think>", "</thought>", "</reasoning>" };
-        for (int i = 1; i < text.Length && i < 13; i++)
-        {
-            var tail = text[^i..];
-            foreach (var tag in candidateTags)
-            {
-                if (tag.StartsWith(tail, StringComparison.OrdinalIgnoreCase))
-                {
-                    return text.Length - i;
-                }
-            }
-        }
         return -1;
     }
 }
